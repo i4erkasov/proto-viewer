@@ -56,7 +56,7 @@ jobs:
           if ((Get-Item $p).Length -eq 0) { throw "protoc zip is empty placeholder: $p" }
           Write-Host "OK: protoc zip size = $((Get-Item $p).Length) bytes"
 
-      - name: Ensure icon exists (CI fallback)
+      - name: Ensure icon exists (CI check)
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -65,24 +65,14 @@ jobs:
 
           $srcSize = (Get-Item $src).Length
           Write-Host "Icon source: $src ($srcSize bytes)"
-          if ($srcSize -lt 200) { throw "Source icon looks too small/corrupted: $src ($srcSize bytes)" }
+          if ($srcSize -lt 50) { throw "Source icon looks too small/corrupted: $src ($srcSize bytes)" }
 
-          # Fyne иногда ожидает иконку рядом с исходниками - всегда делаем копию в cmd/app/assets.
-          $dst = "cmd/app/assets/icon.png"
-          New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-          Copy-Item -Force $src $dst
+          # Validate PNG signature (first 8 bytes)
+          $sig = [IO.File]::ReadAllBytes($src)[0..7]
+          $sigHex = ($sig | ForEach-Object { $_.ToString('X2') }) -join ''
+          if ($sigHex -ne '89504E470D0A1A0A') { throw "Source icon is not a valid PNG (bad signature): $src" }
 
-          $dstSize = (Get-Item $dst).Length
-          Write-Host "Icon copy: $dst ($dstSize bytes)"
-
-          # Debug: hashes help понять, что реально попало в упаковку
-          Write-Host "Icon hashes:" 
-          try {
-            Write-Host "  src sha256=" (Get-FileHash $src -Algorithm SHA256).Hash
-            Write-Host "  dst sha256=" (Get-FileHash $dst -Algorithm SHA256).Hash
-          } catch {
-            Write-Host "  (hash skipped)" 
-          }
+          Write-Host "Icon sha256=" (Get-FileHash $src -Algorithm SHA256).Hash
 
       - name: Package (Windows)
         run: |
