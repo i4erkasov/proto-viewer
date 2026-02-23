@@ -56,6 +56,24 @@ jobs:
           if ((Get-Item $p).Length -eq 0) { throw "protoc zip is empty placeholder: $p" }
           Write-Host "OK: protoc zip size = $((Get-Item $p).Length) bytes"
 
+      - name: Ensure icon exists (CI fallback)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $icon = "assets/icon.png"
+          if (Test-Path $icon) {
+            Write-Host "Icon exists: $icon"
+            exit 0
+          }
+
+          Write-Host "Icon missing: $icon - creating CI fallback icon"
+          New-Item -ItemType Directory -Force -Path (Split-Path $icon) | Out-Null
+
+          # 1x1 transparent PNG
+          $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO8F8o0AAAAASUVORK5CYII="
+          [IO.File]::WriteAllBytes($icon, [Convert]::FromBase64String($b64))
+
       - name: Package (Windows)
         shell: pwsh
         run: |
@@ -64,13 +82,9 @@ jobs:
           $src = "cmd/app"
           if (!(Test-Path $src)) { throw "Missing source dir: $src" }
 
+          # Always pass --icon, because fyne may also read icon from FyneApp.toml
           $icon = "assets/icon.png"
-          if (Test-Path $icon) {
-            fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
-          } else {
-            Write-Host "Icon not found at $icon - packaging without icon"
-            fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer
-          }
+          fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
