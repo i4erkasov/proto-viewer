@@ -60,20 +60,21 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          function Write-Icon([string]$path) {
-            New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+          $src = "assets/icon.png"
+          if (!(Test-Path $src)) { throw "Missing icon source: $src" }
 
-            # Valid tiny PNG (1x1). We always overwrite to avoid corrupted/partial files.
-            $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/P4v0WQAAAABJRU5ErkJggg=="
-            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($b64))
+          # Ensure destination paths exist and always overwrite to avoid corrupted/partial files.
+          $dsts = @(
+            "assets/icon.png",
+            "cmd/app/assets/icon.png"
+          )
 
-            if ((Get-Item $path).Length -lt 50) { throw "Icon write failed: $path" }
-            Write-Host "Icon ready: $path ($((Get-Item $path).Length) bytes)"
+          foreach ($dst in $dsts) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+            Copy-Item -Force $src $dst
+            if ((Get-Item $dst).Length -lt 200) { throw "Icon looks too small/corrupted: $dst" }
+            Write-Host "Icon ready: $dst ($((Get-Item $dst).Length) bytes)"
           }
-
-          # Fyne may look for icon relative to source-dir or repo root.
-          Write-Icon "assets/icon.png"
-          Write-Icon "cmd/app/assets/icon.png"
 
       - name: Package (Windows)
         run: |
@@ -85,7 +86,8 @@ jobs:
           $exe = Join-Path $exeDir "proto-viewer.exe"
           go build -o $exe ./cmd/app
 
-          $iconRel = "cmd/app/assets/icon.png"
+          # Use ONLY this icon (source of truth)
+          $iconRel = "assets/icon.png"
           if (!(Test-Path $iconRel)) { throw "Missing icon: $iconRel" }
           $icon = (Resolve-Path $iconRel).Path
           Write-Host "Using icon: $icon ($((Get-Item $icon).Length) bytes)"
