@@ -1,0 +1,48 @@
+name: windows-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install Fyne CLI
+        run: go install fyne.io/fyne/v2/cmd/fyne@latest
+
+      - name: Verify protoc zip present
+        shell: pwsh
+        run: |
+          $p = "internal/infrastructure/protocbin/protoc_windows_amd64.zip"
+          if (!(Test-Path $p)) { throw "Missing $p" }
+          if ((Get-Item $p).Length -eq 0) { throw "protoc zip is empty placeholder: $p" }
+
+      - name: Package (Windows)
+        run: |
+          fyne package -os windows -name "Proto Viewer" -appID com.i4erkasov.proto-viewer -icon assets/icon.png
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: proto-viewer-windows
+          path: |
+            *.exe
+            *.msi
+            *.zip
+            *.tar.gz
+            *.app
+            dist/**
+          if-no-files-found: warn
+

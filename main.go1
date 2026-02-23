@@ -1,0 +1,533 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/app"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/widget"
+
+	"github.com/redis/go-redis/v9"
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/reflect/protodesc"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/descriptorpb"
+	"google.golang.org/protobuf/types/dynamicpb"
+
+	"compress/gzip"
+	"io"
+)
+
+type extFilter struct{ exts []string }
+
+func (f extFilter) Matches(u fyne.URI) bool {
+	name := strings.ToLower(u.Name())
+	for _, e := range f.exts {
+		if strings.HasSuffix(name, strings.ToLower(e)) {
+			return true
+		}
+	}
+	return false
+}
+func (f extFilter) Name() string { return strings.Join(f.exts, ", ") }
+
+func relToRoot(protoRoot, abs string) (string, error) {
+	rel, err := filepath.Rel(protoRoot, abs)
+	if err != nil {
+		return "", err
+	}
+	rel = filepath.ToSlash(rel)
+	if strings.HasPrefix(rel, "../") || rel == ".." {
+		return "", fmt.Errorf("selected file is not under proto root (-I):\nroot: %s\nfile: %s", protoRoot, abs)
+	}
+	return rel, nil
+}
+
+// quick proto parsing for dropdown (top-level messages)
+var (
+	rePackage = regexp.MustCompile(`(?m)^\s*package\s+([a-zA-Z0-9_.]+)\s*;`)
+	reMessage = regexp.MustCompile(`(?m)^\s*message\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{`)
+)
+
+func parseProtoForTypes(protoBytes []byte) (pkg string, msgs []string) {
+	s := string(protoBytes)
+	if m := rePackage.FindStringSubmatch(s); len(m) == 2 {
+		pkg = strings.TrimSpace(m[1])
+	}
+	all := reMessage.FindAllStringSubmatch(s, -1)
+	seen := map[string]bool{}
+	for _, m := range all {
+		if len(m) == 2 {
+			name := m[1]
+			if !seen[name] {
+				seen[name] = true
+				msgs = append(msgs, name)
+			}
+		}
+	}
+	sort.Strings(msgs)
+	return pkg, msgs
+}
+
+// --- BIN sources
+
+func readBinBytesFromFile(path string) ([]byte, error) {
+	return os.ReadFile(path)
+}
+
+func readBinBytesFromRedis(addr, password string, db int, key string) ([]byte, error) {
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     addr,
+		Password: password,
+		DB:       db,
+	})
+	defer rdb.Close()
+
+	return rdb.Get(ctx, key).Bytes()
+}
+
+// --- Decode Text via protoc
+func decodeWithProtocTextFromBytes(protoRoot, fullType, protoAbs string, binBytes []byte) (string, error) {
+	relProto, err := relToRoot(protoRoot, protoAbs)
+	if err != nil {
+		return "", err
+	}
+
+	args := []string{
+		"-I=" + protoRoot,
+		"--decode=" + fullType,
+		relProto,
+	}
+	cmd := exec.Command("protoc", args...)
+	cmd.Stdin = bytes.NewReader(binBytes)
+
+	var out bytes.Buffer
+	var errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		s := strings.TrimSpace(errBuf.String())
+		if s == "" {
+			s = err.Error()
+		}
+		return "", fmt.Errorf("%s", s)
+	}
+	return out.String(), nil
+}
+
+// --- Decode JSON without generated types (descriptor set + dynamicpb)
+func compileDescriptorSet(protoRoot, protoAbs string) (*descriptorpb.FileDescriptorSet, error) {
+	relProto, err := relToRoot(protoRoot, protoAbs)
+	if err != nil {
+		return nil, err
+	}
+
+	tmp, err := os.CreateTemp("", "protoset-*.pb")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	defer os.Remove(tmpPath)
+
+	args := []string{
+		"-I=" + protoRoot,
+		"--include_imports",
+		"--descriptor_set_out=" + tmpPath,
+		relProto,
+	}
+	cmd := exec.Command("protoc", args...)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		stderr := strings.TrimSpace(errBuf.String())
+		if stderr == "" {
+			stderr = err.Error()
+		}
+		return nil, fmt.Errorf("%s", stderr)
+	}
+
+	b, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, err
+	}
+	var fds descriptorpb.FileDescriptorSet
+	if err := proto.Unmarshal(b, &fds); err != nil {
+		return nil, err
+	}
+	return &fds, nil
+}
+
+func decodeToJSONFromBytes(protoRoot, fullType, protoAbs string, binBytes []byte) (string, error) {
+	fds, err := compileDescriptorSet(protoRoot, protoAbs)
+	if err != nil {
+		return "", err
+	}
+
+	files, err := protodesc.NewFiles(fds)
+	if err != nil {
+		return "", err
+	}
+
+	d, err := files.FindDescriptorByName(protoreflect.FullName(fullType))
+	if err != nil {
+		return "", err
+	}
+	md, ok := d.(protoreflect.MessageDescriptor)
+	if !ok {
+		return "", fmt.Errorf("descriptor is not a message: %s", fullType)
+	}
+
+	msg := dynamicpb.NewMessage(md)
+	if err := proto.Unmarshal(binBytes, msg); err != nil {
+		return "", err
+	}
+
+	jb, err := protojson.MarshalOptions{
+		Multiline:       true,
+		Indent:          "  ",
+		UseProtoNames:   true,
+		EmitUnpopulated: false,
+	}.Marshal(msg)
+	if err != nil {
+		return "", err
+	}
+
+	return string(jb), nil
+}
+
+func gunzipBytes(b []byte) ([]byte, error) {
+	r, err := gzip.NewReader(bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	out, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func main() {
+	a := app.New()
+	w := a.NewWindow("Protobuf BIN Viewer (Fyne)")
+	w.Resize(fyne.NewSize(1100, 780))
+
+	var protoRoot, protoAbs, binAbs string
+	var currentPkg string
+	var currentMsgs []string
+
+	lblRoot := widget.NewLabel("Proto root (-I): (not selected)")
+	lblProto := widget.NewLabel(".proto: (not selected)")
+	lblBin := widget.NewLabel(".bin (for Source=File): (not selected)")
+
+	output := widget.NewMultiLineEntry()
+	output.Wrapping = fyne.TextWrapWord
+	output.SetPlaceHolder("Decoded output will appear here...")
+
+	status := widget.NewLabel("")
+
+	help := widget.NewLabel("Tip: Proto root = repo root (folder that contains core/, common/, etc.)")
+
+	// Output format
+	formatRadio := widget.NewRadioGroup([]string{"Text (protoc)", "JSON"}, func(string) {})
+	formatRadio.SetSelected("Text (protoc)")
+
+	// BIN source selector
+	sourceRadio := widget.NewRadioGroup([]string{"File", "Redis"}, func(string) {})
+	sourceRadio.SetSelected("File")
+
+	gzipCheck := widget.NewCheck("GZIP compressed payload (Redis/file)", func(bool) {})
+	gzipCheck.SetChecked(true) // раз в Redis у вас gzip — удобно по умолчанию
+
+	// Redis form fields
+	redisAddr := widget.NewEntry()
+	redisAddr.SetText("127.0.0.1:6379")
+
+	redisDB := widget.NewEntry()
+	redisDB.SetText("0")
+
+	redisPass := widget.NewPasswordEntry()
+	redisPass.SetPlaceHolder("(optional)")
+
+	redisKey := widget.NewEntry()
+	redisKey.SetPlaceHolder("key for GET (binary protobuf bytes)")
+
+	redisForm := widget.NewForm(
+		widget.NewFormItem("Addr", redisAddr),
+		widget.NewFormItem("DB", redisDB),
+		widget.NewFormItem("Password", redisPass),
+		widget.NewFormItem("Key", redisKey),
+	)
+
+	// Type dropdown + package label
+	lblPkg := widget.NewLabel("package: (unknown)")
+	typeSelect := widget.NewSelect([]string{}, func(string) {})
+	typeSelect.PlaceHolder = "Select message type..."
+
+	btnCopy := widget.NewButton("Copy output", func() {
+		w.Clipboard().SetContent(output.Text)
+		status.SetText("Copied")
+	})
+
+	btnPickRoot := widget.NewButton("Select proto root folder (-I)", func() {
+		d := dialog.NewFolderOpen(func(u fyne.ListableURI, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if u == nil {
+				return
+			}
+			protoRoot = u.Path()
+			lblRoot.SetText("Proto root (-I): " + protoRoot)
+
+			// If proto already selected, re-parse to refresh relative checks
+			if protoAbs != "" {
+				b, err := os.ReadFile(protoAbs)
+				if err == nil {
+					currentPkg, currentMsgs = parseProtoForTypes(b)
+					lblPkg.SetText("package: " + currentPkg)
+					typeSelect.Options = nil
+					for _, m := range currentMsgs {
+						full := m
+						if currentPkg != "" {
+							full = currentPkg + "." + m
+						}
+						typeSelect.Options = append(typeSelect.Options, full)
+					}
+					typeSelect.Refresh()
+				}
+			}
+		}, w)
+		d.Show()
+	})
+
+	btnPickProto := widget.NewButton("Select .proto file", func() {
+		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if r == nil {
+				return
+			}
+			_ = r.Close()
+			protoAbs = r.URI().Path()
+			lblProto.SetText(".proto: " + protoAbs)
+
+			b, err := os.ReadFile(protoAbs)
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+
+			currentPkg, currentMsgs = parseProtoForTypes(b)
+			lblPkg.SetText("package: " + currentPkg)
+
+			typeSelect.Options = nil
+			for _, m := range currentMsgs {
+				full := m
+				if currentPkg != "" {
+					full = currentPkg + "." + m
+				}
+				typeSelect.Options = append(typeSelect.Options, full)
+			}
+			typeSelect.SetSelected("")
+			typeSelect.Refresh()
+		}, w)
+		d.SetFilter(extFilter{exts: []string{".proto"}})
+		d.Show()
+	})
+
+	btnPickBin := widget.NewButton("Select .bin file (Source=File)", func() {
+		d := dialog.NewFileOpen(func(r fyne.URIReadCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if r == nil {
+				return
+			}
+			_ = r.Close()
+			binAbs = r.URI().Path()
+			lblBin.SetText(".bin (for Source=File): " + binAbs)
+		}, w)
+		d.SetFilter(extFilter{exts: []string{".bin"}})
+		d.Show()
+	})
+
+	btnDecode := widget.NewButton("Decode", func() {
+		status.SetText("")
+		output.SetText("")
+
+		// proto selections
+		if protoRoot == "" || protoAbs == "" {
+			dialog.ShowError(fmt.Errorf("select proto root and .proto first"), w)
+			return
+		}
+
+		fullType := strings.TrimSpace(typeSelect.Selected)
+		if fullType == "" {
+			dialog.ShowError(fmt.Errorf("select message type"), w)
+			return
+		}
+
+		if _, err := relToRoot(protoRoot, protoAbs); err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+
+		// BIN bytes from selected source
+		var binBytes []byte
+		var err error
+
+		if sourceRadio.Selected == "File" {
+			if binAbs == "" {
+				dialog.ShowError(fmt.Errorf("select .bin file (Source=File)"), w)
+				return
+			}
+			binBytes, err = readBinBytesFromFile(binAbs)
+		} else {
+			addr := strings.TrimSpace(redisAddr.Text)
+			key := strings.TrimSpace(redisKey.Text)
+
+			if addr == "" || key == "" {
+				dialog.ShowError(fmt.Errorf("fill Redis Addr and Key (Source=Redis)"), w)
+				return
+			}
+
+			db, convErr := strconv.Atoi(strings.TrimSpace(redisDB.Text))
+			if convErr != nil {
+				dialog.ShowError(fmt.Errorf("Redis DB must be a number"), w)
+				return
+			}
+
+			binBytes, err = readBinBytesFromRedis(addr, redisPass.Text, db, key)
+		}
+
+		if err != nil {
+			status.SetText("Error")
+			dialog.ShowError(err, w)
+			return
+		}
+
+		// --- GZIP decompress (если включено)
+		if gzipCheck.Checked {
+			binBytes, err = gunzipBytes(binBytes)
+			if err != nil {
+				status.SetText("Error")
+				dialog.ShowError(fmt.Errorf("gzip decompress failed: %w", err), w)
+				return
+			}
+		}
+
+		// decode
+		status.SetText("Decoding...")
+		var out string
+
+		if formatRadio.Selected == "JSON" {
+			out, err = decodeToJSONFromBytes(protoRoot, fullType, protoAbs, binBytes)
+		} else {
+			out, err = decodeWithProtocTextFromBytes(protoRoot, fullType, protoAbs, binBytes)
+		}
+
+		if err != nil {
+			status.SetText("Error")
+			dialog.ShowError(err, w)
+			return
+		}
+
+		output.SetText(out)
+		status.SetText("OK")
+	})
+
+	btnDecodeRaw := widget.NewButton("Decode RAW (File only)", func() {
+		if binAbs == "" {
+			dialog.ShowError(fmt.Errorf("select .bin first (RAW works for file)"), w)
+			return
+		}
+		binBytes, err := os.ReadFile(binAbs)
+		if err != nil {
+			dialog.ShowError(err, w)
+			return
+		}
+
+		cmd := exec.Command("protoc", "--decode_raw")
+		cmd.Stdin = bytes.NewReader(binBytes)
+		var out bytes.Buffer
+		var errBuf bytes.Buffer
+		cmd.Stdout = &out
+		cmd.Stderr = &errBuf
+		if err := cmd.Run(); err != nil {
+			stderr := strings.TrimSpace(errBuf.String())
+			if stderr == "" {
+				stderr = err.Error()
+			}
+			dialog.ShowError(fmt.Errorf("%s", stderr), w)
+			return
+		}
+		output.SetText(out.String())
+		status.SetText("OK (raw)")
+	})
+
+	settingsAccordion := widget.NewAccordion(
+		widget.NewAccordionItem("Proto settings", container.NewVBox(
+			help, // <-- теперь help реально показывается
+			widget.NewSeparator(),
+			lblRoot,
+			btnPickRoot,
+			widget.NewSeparator(),
+			lblProto,
+			btnPickProto,
+			lblPkg,
+			widget.NewLabel("Message type:"),
+			typeSelect,
+		)),
+		widget.NewAccordionItem("BIN source", container.NewVBox(
+			widget.NewLabel("BIN source:"),
+			sourceRadio,
+			lblBin,
+			btnPickBin,
+		)),
+		widget.NewAccordionItem("Redis settings", container.NewVBox(
+			gzipCheck,
+			redisForm,
+		)),
+		widget.NewAccordionItem("Output format", container.NewVBox(
+			formatRadio,
+			container.NewHBox(btnDecode, btnDecodeRaw, btnCopy, status),
+		)),
+	)
+
+	settingsAccordion.MultiOpen = true
+	// по желанию: открыть только первую секцию
+	settingsAccordion.Open(0)
+
+	split := container.NewVSplit(
+		settingsAccordion,
+		container.NewScroll(output),
+	)
+
+	// чем меньше Offset — тем меньше верх и больше результат
+	split.Offset = 0.28 // попробуй 0.25–0.35 как удобно
+
+	w.SetContent(split)
+	w.ShowAndRun()
+
+}
