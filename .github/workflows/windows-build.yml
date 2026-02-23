@@ -71,8 +71,8 @@ jobs:
             Write-Host "Icon missing: $path - creating CI fallback icon"
             New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
 
-            # 64x64 RGBA PNG (valid) - more robust than 1x1 for some icon pipelines
-            $b64 = "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAABFUlEQVR4nO3QsQ2AMAwEwXn//7kQp3mY2G0sK1Qm8fYg8T0b3gQAAAAAAAAAAAAAAAAAAAAAAAHyJ8z1d7Y2f2qv9b0b0mQK0p1m7e2o3m8bqk1Y0m3oQx2xw0Z8b0c0mK1q3yWm2b0n0b0eY1m0qk1Y0m3oQx2xw0Z8b0c0mK1q3yWm2b0n0b0eY1m0qk1Y0m3oQx2xw0Z8b0c0mK1q3yWm2b0n0b0eY1m0qk1Y0m3oQx2xw0Z8b0c0mK1q3yWm2b0n0b0eY1m0qk1Y0m3oQx2xw0Z8b0c0mK1q3yWm2b0n0b0eY1m0qk1Y0m3oQwAAAAAAAAAAAAAAAAAAAAAAAPwHqv8B8uKf8kUAAAAASUVORK5CYII="
+            # Valid tiny PNG (1x1) - enough for CI packaging
+            $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/P4v0WQAAAABJRU5ErkJggg=="
             [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($b64))
 
             Write-Host "Created icon: $path ($(Get-Item $path).Length bytes)"
@@ -89,19 +89,18 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $src = "cmd/app"
-          if (!(Test-Path $src)) { throw "Missing source dir: $src" }
+          # Build exe from repo root using root go.mod
+          $exeDir = "dist"
+          New-Item -ItemType Directory -Force -Path $exeDir | Out-Null
+          $exe = Join-Path $exeDir "proto-viewer.exe"
+          go build -o $exe ./cmd/app
 
           $iconRel = "cmd/app/assets/icon.png"
           if (!(Test-Path $iconRel)) { throw "Missing icon: $iconRel" }
-
           $icon = (Resolve-Path $iconRel).Path
-          Write-Host "Using icon: $icon ($(Get-Item $icon).Length bytes)"
+          Write-Host "Using icon: $icon ($((Get-Item $icon).Length) bytes)"
 
-          Write-Host "Repo root listing:"; Get-ChildItem -Force | Select-Object Name
-          Write-Host "cmd/app listing:"; Get-ChildItem -Force $src | Select-Object Name
-
-          fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
+          fyne package --os windows --executable $exe --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
