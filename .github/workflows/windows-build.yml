@@ -61,12 +61,15 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          $src = "cmd/app"
+          if (!(Test-Path $src)) { throw "Missing source dir: $src" }
+
           $icon = "assets/icon.png"
           if (Test-Path $icon) {
-            fyne package --os windows --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
+            fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
           } else {
             Write-Host "Icon not found at $icon - packaging without icon"
-            fyne package --os windows --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer
+            fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer
           }
 
       - name: Upload artifacts
@@ -74,10 +77,8 @@ jobs:
         with:
           name: proto-viewer-windows
           path: |
-            *.exe
-            *.msi
-            *.zip
-            *.tar.gz
-            *.app
-            dist/**
+            **/*.exe
+            **/*.msi
+            **/*.zip
+            **/dist/**
           if-no-files-found: warn
