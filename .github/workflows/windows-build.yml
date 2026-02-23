@@ -63,17 +63,25 @@ jobs:
           $src = "assets/icon.png"
           if (!(Test-Path $src)) { throw "Missing icon source: $src" }
 
-          # Ensure destination paths exist and always overwrite to avoid corrupted/partial files.
-          $dsts = @(
-            "assets/icon.png",
-            "cmd/app/assets/icon.png"
-          )
+          $srcSize = (Get-Item $src).Length
+          Write-Host "Icon source: $src ($srcSize bytes)"
+          if ($srcSize -lt 200) { throw "Source icon looks too small/corrupted: $src ($srcSize bytes)" }
 
-          foreach ($dst in $dsts) {
-            New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
-            Copy-Item -Force $src $dst
-            if ((Get-Item $dst).Length -lt 200) { throw "Icon looks too small/corrupted: $dst" }
-            Write-Host "Icon ready: $dst ($((Get-Item $dst).Length) bytes)"
+          # Fyne иногда ожидает иконку рядом с исходниками - всегда делаем копию в cmd/app/assets.
+          $dst = "cmd/app/assets/icon.png"
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+          Copy-Item -Force $src $dst
+
+          $dstSize = (Get-Item $dst).Length
+          Write-Host "Icon copy: $dst ($dstSize bytes)"
+
+          # Debug: hashes help понять, что реально попало в упаковку
+          Write-Host "Icon hashes:" 
+          try {
+            Write-Host "  src sha256=" (Get-FileHash $src -Algorithm SHA256).Hash
+            Write-Host "  dst sha256=" (Get-FileHash $dst -Algorithm SHA256).Hash
+          } catch {
+            Write-Host "  (hash skipped)" 
           }
 
       - name: Package (Windows)
