@@ -26,6 +26,12 @@ jobs:
       - name: Install Fyne CLI
         run: go install fyne.io/tools/cmd/fyne@latest
 
+      - name: Fyne CLI info
+        shell: pwsh
+        run: |
+          fyne --help
+          fyne package --help
+
       - name: Download protoc (Windows x64) into repo path
         shell: pwsh
         run: |
@@ -57,10 +63,10 @@ jobs:
 
           $icon = "assets/icon.png"
           if (Test-Path $icon) {
-            fyne package -os windows -name "Proto Viewer" -appID com.i4erkasov.proto-viewer -icon $icon
+            fyne package --os windows --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
           } else {
             Write-Host "Icon not found at $icon - packaging without icon"
-            fyne package -os windows -name "Proto Viewer" -appID com.i4erkasov.proto-viewer
+            fyne package --os windows --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer
           }
 
       - name: Upload artifacts
