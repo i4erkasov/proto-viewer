@@ -60,30 +60,20 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host "PWD: $(Get-Location)"
-
-          function Ensure-Icon([string]$path) {
-            if (Test-Path $path) {
-              Write-Host "Icon exists: $path ($(Get-Item $path).Length bytes)"
-              return
-            }
-
-            Write-Host "Icon missing: $path - creating CI fallback icon"
+          function Write-Icon([string]$path) {
             New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
 
-            # Valid tiny PNG (1x1) - enough for CI packaging
+            # Valid tiny PNG (1x1). We always overwrite to avoid corrupted/partial files.
             $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/P4v0WQAAAABJRU5ErkJggg=="
             [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($b64))
 
-            Write-Host "Created icon: $path ($(Get-Item $path).Length bytes)"
+            if ((Get-Item $path).Length -lt 50) { throw "Icon write failed: $path" }
+            Write-Host "Icon ready: $path ($((Get-Item $path).Length) bytes)"
           }
 
-          # Fyne may look for icon relative to --source-dir, so ensure both.
-          Ensure-Icon "assets/icon.png"
-          Ensure-Icon "cmd/app/assets/icon.png"
-
-          Write-Host "Icons present:"
-          Get-ChildItem -Recurse -File -Filter icon.png -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table -AutoSize
+          # Fyne may look for icon relative to source-dir or repo root.
+          Write-Icon "assets/icon.png"
+          Write-Icon "cmd/app/assets/icon.png"
 
       - name: Package (Windows)
         run: |
