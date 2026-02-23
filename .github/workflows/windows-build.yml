@@ -61,18 +61,30 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          $icon = "assets/icon.png"
-          if (Test-Path $icon) {
-            Write-Host "Icon exists: $icon"
-            exit 0
+          Write-Host "PWD: $(Get-Location)"
+
+          function Ensure-Icon([string]$path) {
+            if (Test-Path $path) {
+              Write-Host "Icon exists: $path ($(Get-Item $path).Length bytes)"
+              return
+            }
+
+            Write-Host "Icon missing: $path - creating CI fallback icon"
+            New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
+
+            # 1x1 transparent PNG (valid)
+            $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO8F8o0AAAAASUVORK5CYII="
+            [IO.File]::WriteAllBytes($path, [Convert]::FromBase64String($b64))
+
+            Write-Host "Created icon: $path ($(Get-Item $path).Length bytes)"
           }
 
-          Write-Host "Icon missing: $icon - creating CI fallback icon"
-          New-Item -ItemType Directory -Force -Path (Split-Path $icon) | Out-Null
+          # Some fyne configs look relative to source-dir; ensure both exist.
+          Ensure-Icon "assets/icon.png"
+          Ensure-Icon "cmd/app/assets/icon.png"
 
-          # 1x1 transparent PNG
-          $b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO8F8o0AAAAASUVORK5CYII="
-          [IO.File]::WriteAllBytes($icon, [Convert]::FromBase64String($b64))
+          Write-Host "Icons present:"
+          Get-ChildItem -Recurse -File -Filter icon.png -ErrorAction SilentlyContinue | Select-Object FullName, Length | Format-Table -AutoSize
 
       - name: Package (Windows)
         shell: pwsh
@@ -82,8 +94,10 @@ jobs:
           $src = "cmd/app"
           if (!(Test-Path $src)) { throw "Missing source dir: $src" }
 
-          # Always pass --icon, because fyne may also read icon from FyneApp.toml
-          $icon = "assets/icon.png"
+          # Use absolute icon path to avoid any working directory / source-dir confusion.
+          $icon = (Resolve-Path "assets/icon.png").Path
+          Write-Host "Using icon: $icon ($(Get-Item $icon).Length bytes)"
+
           fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
 
       - name: Upload artifacts
