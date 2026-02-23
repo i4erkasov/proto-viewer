@@ -32,16 +32,29 @@ Generate an installer (MSI/EXE). Colleagues run the installer and then launch th
 
 - **macOS/Linux**: we currently rely on `protoc` being available in `PATH` (keeps repo size smaller).
 
-> Important: the repository currently contains an **empty placeholder** zip. You must replace it with a real protoc zip.
+> Important: in this repository the zip is intentionally committed as an **empty placeholder** (0 bytes), to avoid shipping binaries.
+> If your CI checks for a non-empty file (recommended), you must provide a real `protoc` zip at build time.
 
 ## Provide protoc zip (Windows)
+
+### Option A (simplest): commit the real zip
 
 1. Download the official protoc Windows archive from Google:
    `protoc-<version>-win64.zip`
 2. Copy it into:
    `internal/infrastructure/protocbin/protoc_windows_amd64.zip`
 
-No code changes needed.
+Now both local Windows builds and CI will pass the “non-empty zip” check.
+
+### Option B (recommended for CI): download protoc zip in the pipeline
+
+Don’t commit binaries. Instead, in your Windows GitHub Actions job:
+
+1. Download `protoc-<version>-win64.zip`.
+2. Save it into `internal/infrastructure/protocbin/protoc_windows_amd64.zip`.
+3. Continue with `fyne package ...`.
+
+If you can’t fetch it from the internet (restricted network), store the zip as a workflow artifact, a release asset, or in internal storage.
 
 ---
 
@@ -94,6 +107,7 @@ In both cases you ship `Proto Viewer.exe` + assets (if any). `protoc` is already
 If you don’t want to build on your local Windows machine:
 
 - Use a Windows GitHub Actions runner
+- Download/provide `protoc_windows_amd64.zip` during the job (see Option B)
 - Build with `fyne package -os windows ...`
 - Upload resulting `.exe` and/or installer as workflow artifacts
 

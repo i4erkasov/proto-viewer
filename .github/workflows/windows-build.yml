@@ -5,6 +5,10 @@ on:
   push:
     branches: [ main, master ]
 
+env:
+  # Pin protoc version for reproducible builds
+  PROTOC_VERSION: "29.3"
+
 jobs:
   build:
     runs-on: windows-latest
@@ -22,12 +26,29 @@ jobs:
       - name: Install Fyne CLI
         run: go install fyne.io/fyne/v2/cmd/fyne@latest
 
+      - name: Download protoc (Windows x64) into repo path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $dst = "internal/infrastructure/protocbin/protoc_windows_amd64.zip"
+          New-Item -ItemType Directory -Force -Path (Split-Path $dst) | Out-Null
+
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+          Write-Host "Downloading protoc from $url"
+
+          # Use TLS 1.2+ in older PS environments
+          try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+          Invoke-WebRequest -Uri $url -OutFile $dst
+
       - name: Verify protoc zip present
         shell: pwsh
         run: |
           $p = "internal/infrastructure/protocbin/protoc_windows_amd64.zip"
           if (!(Test-Path $p)) { throw "Missing $p" }
           if ((Get-Item $p).Length -eq 0) { throw "protoc zip is empty placeholder: $p" }
+          Write-Host "OK: protoc zip size = $((Get-Item $p).Length) bytes"
 
       - name: Package (Windows)
         run: |
@@ -45,4 +66,3 @@ jobs:
             *.app
             dist/**
           if-no-files-found: warn
-
