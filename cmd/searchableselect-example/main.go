@@ -7,8 +7,7 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
-
-	"github.com/i4erkasov/proto-viewer/internal/application/components/searchselect"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/searchselect"
 )
 
 func main() {

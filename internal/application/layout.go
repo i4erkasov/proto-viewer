@@ -2,23 +2,27 @@ package application
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/protopicker"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/searchselect"
 
-	"github.com/i4erkasov/proto-viewer/internal/application/components/protopicker"
 	"github.com/i4erkasov/proto-viewer/internal/application/tab"
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/protodec"
@@ -30,6 +34,306 @@ const prefLastProtoRoot = "lastProtoRoot"
 func build(w fyne.Window) fyne.CanvasObject {
 	dec := protodec.New()
 	prefs := fyne.CurrentApp().Preferences()
+
+	// Status label (used by proto parsing + decoding)
+	lblStatus := widget.NewLabel("Status: idle")
+	lblStatus.TextStyle = fyne.TextStyle{Monospace: true}
+
+	// Cache for parsed message types from .proto (path -> mtime/size -> options)
+	type protoTypeCacheEntry struct {
+		mtime int64
+		size  int64
+		opts  []string
+	}
+	var protoTypeCache struct {
+		mu    sync.Mutex
+		items map[string]protoTypeCacheEntry
+	}
+	protoTypeCache.items = make(map[string]protoTypeCacheEntry)
+
+	// Helpers
+	splitLines := func(s string) []string {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		s = strings.ReplaceAll(s, "\r", "\n")
+		if s == "" {
+			return nil
+		}
+		return strings.Split(s, "\n")
+	}
+
+	openFolder := func(p string) error {
+		if p == "" {
+			return fmt.Errorf("empty path")
+		}
+		dir := p
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			dir = filepath.Dir(p)
+		}
+		switch runtime.GOOS {
+		case "darwin":
+			return exec.Command("open", dir).Start()
+		case "windows":
+			return exec.Command("explorer", dir).Start()
+		default:
+			return exec.Command("xdg-open", dir).Start()
+		}
+	}
+
+	// Keep full outputs in memory (UI shows preview for large payloads).
+	var fullJSON string
+	var fullLines []string
+
+	// Output widget (lazy-loaded)
+	outText := widget.NewRichTextWithText("")
+	outText.Wrapping = fyne.TextWrapWord
+	outScroll := container.NewScroll(outText)
+
+	const initialLines = 200
+	const linesPerChunk = 400
+	const loadMoreThresholdPx float32 = 120
+	var visibleLines int
+	var inLoadMore bool
+	var loadMore func()
+
+	updateStatusLoaded := func() {
+		if len(fullLines) == 0 {
+			return
+		}
+		lblStatus.SetText(fmt.Sprintf("Status: OK (%d/%d lines)", visibleLines, len(fullLines)))
+	}
+
+	setOutput := func(s string) {
+		fullLines = splitLines(s)
+		visibleLines = 0
+		if loadMore != nil {
+			loadMore()
+		}
+
+		// If we have output to show, grow window height a bit (once per setOutput call)
+		// so users can see more lines without manual resize.
+		fyne.Do(func() {
+			cs := w.Canvas().Size()
+			if cs.Height <= 0 {
+				return
+			}
+			targetH := cs.Height + 300
+			if targetH > 940 {
+				targetH = 940
+			}
+			if targetH > cs.Height {
+				w.Resize(fyne.NewSize(cs.Width, targetH))
+			}
+		})
+	}
+
+	loadMore = func() {
+		if inLoadMore {
+			return
+		}
+		if visibleLines >= len(fullLines) {
+			return
+		}
+		inLoadMore = true
+		defer func() { inLoadMore = false }()
+
+		next := visibleLines
+		if next == 0 {
+			next = initialLines
+		} else {
+			next = visibleLines + linesPerChunk
+		}
+		if next > len(fullLines) {
+			next = len(fullLines)
+		}
+		visibleLines = next
+		outText.ParseMarkdown("```json\n" + strings.Join(fullLines[:visibleLines], "\n") + "\n```")
+		outText.Refresh()
+		updateStatusLoaded()
+	}
+
+	outScroll.OnScrolled = func(pos fyne.Position) {
+		viewH := outScroll.Size().Height
+		if viewH <= 0 {
+			return
+		}
+		contentH := outText.MinSize().Height
+		if contentH <= viewH {
+			return
+		}
+		if pos.Y+viewH >= contentH-loadMoreThresholdPx {
+			loadMore()
+		}
+	}
+
+	// ---- Decode output cache (File tab / local files only)
+	type decodeCacheMeta struct {
+		InputPath   string `json:"inputPath"`
+		InputSize   int64  `json:"inputSize"`
+		InputMtime  int64  `json:"inputMtime"`
+		ProtoFile   string `json:"protoFile"`
+		ProtoSize   int64  `json:"protoSize"`
+		ProtoMtime  int64  `json:"protoMtime"`
+		MessageType string `json:"messageType"`
+		Gzip        bool   `json:"gzip"`
+		Key         string `json:"key"`
+		CreatedAt   int64  `json:"createdAt"`
+	}
+
+	normalizeLocalPath := func(s string) string {
+		s = strings.TrimSpace(s)
+		if strings.HasPrefix(s, "file://") {
+			s = strings.TrimPrefix(s, "file://")
+		}
+		return s
+	}
+
+	workDir := func() string {
+		exe, err := os.Executable()
+		if err != nil {
+			return "."
+		}
+		d := filepath.Dir(exe)
+		if d == "" {
+			return "."
+		}
+		return d
+	}
+
+	cacheDir := func() string {
+		return filepath.Join(workDir(), "decode")
+	}
+	cacheMetaDir := func() string {
+		return filepath.Join(cacheDir(), "meta")
+	}
+
+	ensureDir := func(dir string) error {
+		if dir == "" {
+			return fmt.Errorf("empty dir")
+		}
+		return os.MkdirAll(dir, 0o755)
+	}
+
+	// Try to reveal a file in OS file manager (select the file).
+	revealFile := func(p string) error {
+		if p == "" {
+			return fmt.Errorf("empty path")
+		}
+		switch runtime.GOOS {
+		case "darwin":
+			return exec.Command("open", "-R", p).Start()
+		case "windows":
+			return exec.Command("explorer", "/select,", p).Start()
+		default:
+			// Most linux file managers don't have stable select flag; open folder.
+			return openFolder(p)
+		}
+	}
+
+	cacheKey := func(inputPath, protoFileAbs, msgType string, gzip bool, inFI, protoFI os.FileInfo) string {
+		h := sha256.New()
+		_, _ = h.Write([]byte(inputPath))
+		_, _ = h.Write([]byte("\n"))
+		_, _ = h.Write([]byte(protoFileAbs))
+		_, _ = h.Write([]byte("\n"))
+		_, _ = h.Write([]byte(msgType))
+		_, _ = h.Write([]byte("\n"))
+		if gzip {
+			_, _ = h.Write([]byte("gzip=1\n"))
+		} else {
+			_, _ = h.Write([]byte("gzip=0\n"))
+		}
+		if inFI != nil {
+			_, _ = h.Write([]byte(fmt.Sprintf("in_mtime=%d in_size=%d\n", inFI.ModTime().UnixNano(), inFI.Size())))
+		}
+		if protoFI != nil {
+			_, _ = h.Write([]byte(fmt.Sprintf("proto_mtime=%d proto_size=%d\n", protoFI.ModTime().UnixNano(), protoFI.Size())))
+		}
+		sum := h.Sum(nil)
+		return fmt.Sprintf("%x", sum)
+	}
+
+	cachePaths := func(key string) (jsonPath, metaPath string) {
+		jsonPath = filepath.Join(cacheDir(), key+".json")
+		metaPath = filepath.Join(cacheMetaDir(), key+".meta.json")
+		return
+	}
+
+	readCacheIfFresh := func(key string) (jsonText string, ok bool, _ error) {
+		jsonPath, metaPath := cachePaths(key)
+		mb, err := os.ReadFile(metaPath)
+		if err != nil {
+			return "", false, nil
+		}
+		var meta decodeCacheMeta
+		if err := json.Unmarshal(mb, &meta); err != nil {
+			return "", false, nil
+		}
+		if meta.Key != key {
+			return "", false, nil
+		}
+		jb, err := os.ReadFile(jsonPath)
+		if err != nil {
+			return "", false, nil
+		}
+		return string(jb), true, nil
+	}
+
+	writeCache := func(key string, meta decodeCacheMeta, jsonText string) (jsonPath string, _ error) {
+		if err := ensureDir(cacheDir()); err != nil {
+			return "", err
+		}
+		if err := ensureDir(cacheMetaDir()); err != nil {
+			return "", err
+		}
+		jsonPath, metaPath := cachePaths(key)
+		meta.Key = key
+		meta.CreatedAt = time.Now().Unix()
+		metaBytes, _ := json.MarshalIndent(meta, "", "  ")
+
+		writeOne := func(path string, content []byte) error {
+			tmp := path + ".tmp"
+			if err := os.WriteFile(tmp, content, 0o644); err != nil {
+				return err
+			}
+			return os.Rename(tmp, path)
+		}
+		if err := writeOne(jsonPath, []byte(jsonText)); err != nil {
+			return "", err
+		}
+		if err := writeOne(metaPath, metaBytes); err != nil {
+			return "", err
+		}
+		return jsonPath, nil
+	}
+
+	// For non-file sources (e.g. Redis) we still want to save large outputs for удобства.
+	// File name: based on key + timestamp.
+	saveLargeOutput := func(baseName, jsonText string) (string, error) {
+		if err := ensureDir(cacheDir()); err != nil {
+			return "", err
+		}
+		baseName = strings.TrimSpace(baseName)
+		if baseName == "" {
+			baseName = "output"
+		}
+		// sanitize for filesystem
+		repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", " ", "_")
+		baseName = repl.Replace(baseName)
+		if len(baseName) > 80 {
+			baseName = baseName[:80]
+		}
+		ts := time.Now().Format("20060102-150405")
+		path := filepath.Join(cacheDir(), fmt.Sprintf("%s-%s.json", baseName, ts))
+		// atomic write
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(jsonText), 0o644); err != nil {
+			return "", err
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
 
 	// ---- Global settings (shared)
 	protoRoot := widget.NewEntry()
@@ -68,10 +372,7 @@ func build(w fyne.Window) fyne.CanvasObject {
 	}
 
 	// тип выбран из списка
-	typeSelect := widget.NewSelect([]string{}, func(string) {})
-	typeSelect.PlaceHolder = "Select message type…"
-
-	selectedType := widget.NewLabel("Selected: (none)")
+	typeSelect := searchselect.NewSearchableSelect(w, "Select message type…", []string{})
 
 	// message type validation/error hint (english)
 	typeErr := widget.NewLabel("")
@@ -92,10 +393,8 @@ func build(w fyne.Window) fyne.CanvasObject {
 
 	resetProtoSelection := func() {
 		protoFile.SetText("")
-		typeSelect.Options = nil
+		typeSelect.SetOptions(nil)
 		typeSelect.SetSelected("")
-		typeSelect.Refresh()
-		selectedType.SetText("Selected: (none)")
 		noteTypeError("")
 	}
 
@@ -119,12 +418,10 @@ func build(w fyne.Window) fyne.CanvasObject {
 	// ---- Source tabs (File/Redis/SQL)
 	fileTab := tab.NewTabFile(w)
 	redisTab := tab.NewTabRedis(w)
-	sqlTab := tab.NewTabSQL(w)
 
 	sourceTabs := container.NewAppTabs(
 		container.NewTabItem(fileTab.Title(), container.NewBorder(fileTab.View(), nil, nil, nil, nil)),
 		container.NewTabItem(redisTab.Title(), container.NewBorder(redisTab.View(), nil, nil, nil, nil)),
-		container.NewTabItem(sqlTab.Title(), container.NewBorder(sqlTab.View(), nil, nil, nil, nil)),
 	)
 	sourceTabs.SetTabLocation(container.TabLocationTop)
 
@@ -142,7 +439,7 @@ func build(w fyne.Window) fyne.CanvasObject {
 			noteTypeError("Proto file is not selected")
 			return
 		}
-		if len(typeSelect.Options) == 0 {
+		if len(typeSelect.Options()) == 0 {
 			noteTypeError("No message types found in the selected .proto")
 			return
 		}
@@ -163,16 +460,16 @@ func build(w fyne.Window) fyne.CanvasObject {
 			src = fileTab
 		case 1:
 			src = redisTab
-		case 2:
-			src = sqlTab
 		default:
 			noteTypeError("Unknown source tab")
 			return
 		}
-		if m, ok := src.(interface {
-			FetchMany(context.Context) ([][]byte, error)
-		}); ok {
-			srcMany = m
+		// Effective gzip can be overridden by the active tab (Redis).
+		effectiveGzip := gzipCheck.Checked
+		if sourceTabs.SelectedIndex() == 1 {
+			if gz, ok := any(redisTab).(interface{ Gzip() bool }); ok {
+				effectiveGzip = gz.Gzip()
+			}
 		}
 
 		payloads := make([][]byte, 0, 1)
@@ -198,7 +495,7 @@ func build(w fyne.Window) fyne.CanvasObject {
 
 		// Try each type and collect all successful decodes (all payloads must decode).
 		matches := make([]string, 0, 8)
-		for _, fullType := range typeSelect.Options {
+		for _, fullType := range typeSelect.Options() {
 			allOK := true
 			for _, p := range payloads {
 				tryCtx, tryCancel := context.WithTimeout(ctx, 900*time.Millisecond)
@@ -206,7 +503,7 @@ func build(w fyne.Window) fyne.CanvasObject {
 					ProtoRoot: root,
 					ProtoFile: protoAbs,
 					FullType:  fullType,
-					Gzip:      gzipCheck.Checked,
+					Gzip:      effectiveGzip,
 					Format:    domain.OutputFormatJSON,
 					Bytes:     p,
 				})
@@ -229,8 +526,6 @@ func build(w fyne.Window) fyne.CanvasObject {
 		// If there is exactly one match, apply it directly.
 		if len(matches) == 1 {
 			typeSelect.SetSelected(matches[0])
-			typeSelect.Refresh()
-			selectedType.SetText("Selected: " + matches[0])
 			return
 		}
 
@@ -257,8 +552,6 @@ func build(w fyne.Window) fyne.CanvasObject {
 					return
 				}
 				typeSelect.SetSelected(s)
-				typeSelect.Refresh()
-				selectedType.SetText("Selected: " + s)
 			},
 			w,
 		)
@@ -312,25 +605,63 @@ func build(w fyne.Window) fyne.CanvasObject {
 
 		p, err := protopicker.New(w, root, func(absP string) {
 			protoFile.SetText(absP)
-			b, err := os.ReadFile(absP)
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-			pkg, msgs := protoutil.ParseProtoForTypes(b)
-			opts := make([]string, 0, len(msgs))
-			for _, m := range msgs {
-				full := m
-				if pkg != "" {
-					full = pkg + "." + m
+
+			// Parse types in background (big proto files can be slow).
+			lblStatus.SetText("Status: parsing proto…")
+
+			go func(path string) {
+				fi, err := os.Stat(path)
+				if err != nil {
+					fyne.Do(func() {
+						lblStatus.SetText("Status: error")
+						dialog.ShowError(err, w)
+					})
+					return
 				}
-				opts = append(opts, full)
-			}
-			typeSelect.Options = opts
-			typeSelect.SetSelected("")
-			typeSelect.Refresh()
-			selectedType.SetText("Selected: (none)")
-			noteTypeError("")
+
+				// cache lookup
+				protoTypeCache.mu.Lock()
+				ce, ok := protoTypeCache.items[path]
+				protoTypeCache.mu.Unlock()
+				if ok && ce.mtime == fi.ModTime().Unix() && ce.size == fi.Size() {
+					fyne.Do(func() {
+						lblStatus.SetText("Status: OK")
+						typeSelect.SetOptions(ce.opts)
+						typeSelect.SetSelected("")
+						noteTypeError("")
+					})
+					return
+				}
+
+				b, err := os.ReadFile(path)
+				if err != nil {
+					fyne.Do(func() {
+						lblStatus.SetText("Status: error")
+						dialog.ShowError(err, w)
+					})
+					return
+				}
+				pkg, msgs := protoutil.ParseProtoForTypes(b)
+				opts := make([]string, 0, len(msgs))
+				for _, m := range msgs {
+					full := m
+					if pkg != "" {
+						full = pkg + "." + m
+					}
+					opts = append(opts, full)
+				}
+
+				protoTypeCache.mu.Lock()
+				protoTypeCache.items[path] = protoTypeCacheEntry{mtime: fi.ModTime().Unix(), size: fi.Size(), opts: opts}
+				protoTypeCache.mu.Unlock()
+
+				fyne.Do(func() {
+					lblStatus.SetText("Status: OK")
+					typeSelect.SetOptions(opts)
+					typeSelect.SetSelected("")
+					noteTypeError("")
+				})
+			}(absP)
 		})
 		if err != nil {
 			dialog.ShowError(err, w)
@@ -367,347 +698,356 @@ func build(w fyne.Window) fyne.CanvasObject {
 		protoFileRow,
 		msgTypeRow,
 		typeErr,
-		selectedType,
 		widget.NewSeparator(),
 	)
 
-	// keep selected label synced
-	typeSelect.OnChanged = func(s string) {
-		noteTypeError("")
-		if strings.TrimSpace(s) == "" {
-			selectedType.SetText("Selected: (none)")
-			return
-		}
-		selectedType.SetText("Selected: " + s)
-	}
-
 	// ---- Result area
-	status := widget.NewLabel("Status: idle")
+	// remove unused local status label (we use lblStatus already)
 
-	jsonOut := widget.NewMultiLineEntry()
-	jsonOut.Wrapping = fyne.TextWrapWord
-	jsonOut.TextStyle = fyne.TextStyle{Monospace: true}
-	jsonOut.SetPlaceHolder("JSON output…")
-
-	rawOut := widget.NewMultiLineEntry()
-	rawOut.Wrapping = fyne.TextWrapWord
-	rawOut.SetPlaceHolder("RAW output…")
-
-	jsonScroll := container.NewScroll(jsonOut)
-	rawScroll := container.NewScroll(rawOut)
-
-	contentStack := container.NewStack(jsonScroll, rawScroll)
-	showJSON := func() {
-		jsonScroll.Show()
-		rawScroll.Hide()
-		contentStack.Refresh()
-	}
-	showRAW := func() {
-		rawScroll.Show()
-		jsonScroll.Hide()
-		contentStack.Refresh()
-	}
-	showJSON()
-
-	activeIsJSON := true
-
-	btnTabJSON := widget.NewButton("JSON", nil)
-	btnTabRAW := widget.NewButton("RAW", nil)
-	btnTabJSON.Importance = widget.LowImportance
-	btnTabRAW.Importance = widget.LowImportance
-
-	ulJSON := canvas.NewRectangle(theme.Color(theme.ColorNamePrimary))
-	ulRAW := canvas.NewRectangle(theme.Color(theme.ColorNamePrimary))
-	ulH := theme.Size(theme.SizeNameSeparatorThickness)
-	if ulH < 2 {
-		ulH = 2
-	}
-	ulJSON.SetMinSize(fyne.NewSize(1, ulH))
-	ulRAW.SetMinSize(fyne.NewSize(1, ulH))
-
-	jsonTab := container.NewVBox(btnTabJSON, ulJSON)
-	rawTab := container.NewVBox(btnTabRAW, ulRAW)
-
-	setUnderline := func(isJSON bool) {
-		if isJSON {
-			ulJSON.Show()
-			ulRAW.Hide()
-		} else {
-			ulRAW.Show()
-			ulJSON.Hide()
-		}
-		ulJSON.Refresh()
-		ulRAW.Refresh()
-	}
-
-	setActiveTab := func(isJSON bool) {
-		activeIsJSON = isJSON
-		setUnderline(isJSON)
-		if isJSON {
-			showJSON()
-			return
-		}
-		showRAW()
-	}
-
-	btnTabJSON.OnTapped = func() { setActiveTab(true) }
-	btnTabRAW.OnTapped = func() { setActiveTab(false) }
-	setActiveTab(true)
-
-	// --- Expand/collapse output
+	// Expand/collapse output
 	var isOutputExpanded bool
 	btnToggleOutput := widget.NewButtonWithIcon("", theme.ViewFullScreenIcon(), nil)
 	btnToggleOutput.Importance = widget.LowImportance
 
-	// Строка табов результата: табы слева, toggle справа (в одной линии)
-	tabsHeader := container.NewBorder(nil, nil, container.NewHBox(jsonTab, rawTab), btnToggleOutput, nil)
+	// Header: only toggle on the right (no global gzip row)
+	resultHeader := container.NewBorder(nil, nil, nil, btnToggleOutput, nil)
 
-	btnDecode := widget.NewButtonWithIcon("Decode", theme.ViewRefreshIcon(), func() {
-		status.SetText("Status: decoding…")
+	// Decode button (wiring TODO - placeholder to keep layout stable)
+	btnDecode := widget.NewButtonWithIcon("Decode", theme.ViewRefreshIcon(), nil)
+	btnDecode.Importance = widget.MediumImportance
+	btnDecode.OnTapped = func() {
+		lblStatus.SetText("Status: decoding…")
 		noteTypeError("")
 
 		root := strings.TrimSpace(protoRoot.Text)
 		protoAbs := strings.TrimSpace(protoFile.Text)
-		typeName := strings.TrimSpace(typeSelect.Selected)
+		typeName := strings.TrimSpace(typeSelect.Selected())
 		if root == "" || protoAbs == "" || typeName == "" {
-			status.SetText("Status: error")
+			lblStatus.SetText("Status: error")
 			dialog.ShowError(fmt.Errorf("proto root, proto file and message type are required"), w)
 			return
 		}
+		if !isInsideRoot(root, protoAbs) {
+			lblStatus.SetText("Status: error")
+			dialog.ShowError(fmt.Errorf("proto file must be inside proto root"), w)
+			return
+		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
+		// file cache only for File tab and local path
+		fileInputPath := ""
+		if sourceTabs.SelectedIndex() == 0 {
+			p := strings.TrimSpace(fileTab.InputPath())
+			p = normalizeLocalPath(p)
+			if p != "" {
+				if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+					fileInputPath = p
+				}
+			}
+		}
 
+		if fileInputPath != "" {
+			inFI, _ := os.Stat(fileInputPath)
+			protoFI, _ := os.Stat(protoAbs)
+			key := cacheKey(fileInputPath, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
+			if cached, ok, _ := readCacheIfFresh(key); ok {
+				fullJSON = cached
+				setOutput(fullJSON)
+				lblStatus.SetText("Status: OK (from cache)")
+				return
+			}
+		}
+
+		// Choose source based on active tab.
 		var src interface {
 			Fetch(context.Context) ([]byte, error)
 		}
+		// Allow per-tab GZIP flag override (Redis row checkbox).
+		effectiveGzip := gzipCheck.Checked
 		switch sourceTabs.SelectedIndex() {
 		case 0:
 			src = fileTab
 		case 1:
 			src = redisTab
-		case 2:
-			src = sqlTab
+			if gz, ok := any(redisTab).(interface{ Gzip() bool }); ok {
+				effectiveGzip = gz.Gzip()
+			}
 		default:
-			status.SetText("Status: error")
+			lblStatus.SetText("Status: error")
 			dialog.ShowError(fmt.Errorf("unknown source tab"), w)
 			return
 		}
 
-		// Support multi-payload sources.
-		payloads := make([][]byte, 0, 1)
-		if m, ok := src.(interface {
-			FetchMany(context.Context) ([][]byte, error)
-		}); ok {
-			arr, err := m.FetchMany(ctx)
-			if err != nil {
-				status.SetText("Status: error")
-				dialog.ShowError(err, w)
-				return
-			}
-			payloads = arr
-		} else {
+		btnDecode.Disable()
+		btnDecode.Refresh()
+
+		go func() {
+			defer fyne.Do(func() {
+				btnDecode.Enable()
+				btnDecode.Refresh()
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+
 			payload, err := src.Fetch(ctx)
 			if err != nil {
-				status.SetText("Status: error")
-				dialog.ShowError(err, w)
+				fyne.Do(func() {
+					lblStatus.SetText("Status: error")
+					dialog.ShowError(err, w)
+				})
 				return
 			}
-			payloads = append(payloads, payload)
-		}
-		if len(payloads) == 0 {
-			status.SetText("Status: error")
-			dialog.ShowError(fmt.Errorf("no data"), w)
-			return
-		}
 
-		// GZIP hint logic expects a single payload; keep it as before,
-		// but use the first payload for file-tab heuristics.
+			res, err := dec.Decode(ctx, domain.DecodeRequest{
+				ProtoRoot: root,
+				ProtoFile: protoAbs,
+				FullType:  typeName,
+				Gzip:      effectiveGzip,
+				Format:    domain.OutputFormatJSON,
+				Bytes:     payload,
+			})
+			if err != nil {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: error")
+					dialog.ShowError(err, w)
+				})
+				return
+			}
 
-		if sourceTabs.SelectedIndex() == 0 {
-			if fileTab.LastHTTPWasGzipped() {
-				gzipCheck.SetChecked(false)
-				gzipCheck.Disable()
-				gzipHint.SetText("HTTP gzip decoded")
-				gzipHint.Show()
-			} else {
-				gzipCheck.Enable()
-				gzipHint.Hide()
-				if fileTab.LastInputLooksGzip() {
-					gzipCheck.SetChecked(true)
+			// For large JSON skip pretty printing (it can be slow)
+			jsonText := res.Raw
+			if len(jsonText) <= 512_000 {
+				var v any
+				if err := json.Unmarshal([]byte(jsonText), &v); err == nil {
+					if pretty, err := json.MarshalIndent(v, "", "  "); err == nil {
+						jsonText = string(pretty)
+					}
 				}
 			}
-		} else {
-			gzipCheck.Enable()
-			gzipHint.Hide()
-		}
-		gzipHint.Refresh()
-		gzipCheck.Refresh()
 
-		// Decode JSON for each payload.
-		jsonItems := make([]json.RawMessage, 0, len(payloads))
-		autoGzip := false
-		for _, p := range payloads {
-			jsonRes, err := dec.Decode(ctx, domain.DecodeRequest{
-				ProtoRoot: root,
-				ProtoFile: protoAbs,
-				FullType:  typeName,
-				Gzip:      gzipCheck.Checked,
-				Format:    domain.OutputFormatJSON,
-				Bytes:     p,
+			// Cache only for File tab
+			cachedPath := ""
+			if fileInputPath != "" {
+				inFI, _ := os.Stat(fileInputPath)
+				protoFI, _ := os.Stat(protoAbs)
+				key := cacheKey(fileInputPath, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
+				meta := decodeCacheMeta{InputPath: fileInputPath, ProtoFile: protoAbs, MessageType: typeName, Gzip: gzipCheck.Checked}
+				if inFI != nil {
+					meta.InputSize = inFI.Size()
+					meta.InputMtime = inFI.ModTime().UnixNano()
+				}
+				if protoFI != nil {
+					meta.ProtoSize = protoFI.Size()
+					meta.ProtoMtime = protoFI.ModTime().UnixNano()
+				}
+				if p, err := writeCache(key, meta, jsonText); err == nil {
+					cachedPath = p
+				}
+			}
+
+			// For Redis (and other non-file sources) also save large outputs to a file.
+			if cachedPath == "" && sourceTabs.SelectedIndex() == 1 {
+				k := "redis"
+				if rk, ok := any(redisTab).(interface{ SelectedKey() string }); ok {
+					if v := strings.TrimSpace(rk.SelectedKey()); v != "" {
+						k = v
+					}
+				}
+				if p, err := saveLargeOutput(k, jsonText); err == nil {
+					cachedPath = p
+				}
+			}
+
+			// If it's big - offer: open folder (select file) or show in output.
+			const bigJSON = 2_000_000
+			if len(jsonText) >= bigJSON && cachedPath != "" {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: OK (saved to file)")
+
+					// Build dialog content with custom buttons so we can place icons.
+					var dlg dialog.Dialog
+
+					btnShow := widget.NewButtonWithIcon("Show in output", theme.VisibilityIcon(), func() {
+						fullJSON = jsonText
+						setOutput(fullJSON)
+						lblStatus.SetText("Status: OK")
+						if dlg != nil {
+							dlg.Hide()
+						}
+					})
+
+					// Open folder: single button widget (icon is part of the button).
+					btnOpen := widget.NewButtonWithIcon("Open folder", theme.FolderOpenIcon(), func() {
+						_ = revealFile(cachedPath)
+						if dlg != nil {
+							dlg.Hide()
+						}
+					})
+					btnOpen.Importance = widget.HighImportance
+
+					btnCancel := widget.NewButtonWithIcon("Close", theme.CancelIcon(), func() {
+						if dlg != nil {
+							dlg.Hide()
+						}
+					})
+					btnCancel.Importance = widget.LowImportance
+
+					content := container.NewVBox(
+						widget.NewLabel("Output is large. You can show it in the app (may be slower) or open the folder with the saved JSON file."),
+						widget.NewSeparator(),
+						container.NewHBox(layout.NewSpacer(), btnCancel, btnShow, btnOpen),
+					)
+
+					dlg = dialog.NewCustomWithoutButtons("Large output", content, w)
+					dlg.Resize(fyne.NewSize(620, 180))
+					dlg.Show()
+				})
+				return
+			}
+
+			fyne.Do(func() {
+				fullJSON = jsonText
+				setOutput(fullJSON)
+				lblStatus.SetText("Status: OK")
 			})
-			if err != nil {
-				status.SetText("Status: error")
-				dialog.ShowError(err, w)
-				return
-			}
-			if jsonRes.AutoDetectedGzip {
-				autoGzip = true
-			}
-
-			// Ensure each element is valid JSON before wrapping into an array.
-			b := []byte(jsonRes.Raw)
-			var tmp any
-			if err := json.Unmarshal(b, &tmp); err != nil {
-				status.SetText("Status: error")
-				dialog.ShowError(fmt.Errorf("decoded JSON is invalid: %w", err), w)
-				return
-			}
-			jsonItems = append(jsonItems, json.RawMessage(b))
-		}
-
-		if autoGzip {
-			gzipCheck.SetChecked(true)
-			gzipCheck.Refresh()
-		}
-
-		if len(jsonItems) == 1 {
-			jsonOut.SetText(string(jsonItems[0]))
-		} else {
-			arrBytes, _ := json.MarshalIndent(jsonItems, "", "  ")
-			jsonOut.SetText(string(arrBytes))
-		}
-
-		// RAW output: concatenate, separated.
-		rawParts := make([]string, 0, len(payloads))
-		autoGzip = false
-		for i, p := range payloads {
-			rawRes, err := dec.Decode(ctx, domain.DecodeRequest{
-				ProtoRoot: root,
-				ProtoFile: protoAbs,
-				FullType:  typeName,
-				Gzip:      gzipCheck.Checked,
-				Format:    domain.OutputFormatRAW,
-				Bytes:     p,
-			})
-			if err != nil {
-				status.SetText("Status: error")
-				dialog.ShowError(err, w)
-				return
-			}
-			if rawRes.AutoDetectedGzip {
-				autoGzip = true
-			}
-			if len(payloads) > 1 {
-				rawParts = append(rawParts, fmt.Sprintf("#%d\n%s", i+1, rawRes.Raw))
-			} else {
-				rawParts = append(rawParts, rawRes.Raw)
-			}
-		}
-		if autoGzip {
-			gzipCheck.SetChecked(true)
-			gzipCheck.Refresh()
-		}
-		rawOut.SetText(strings.Join(rawParts, "\n\n"))
-
-		status.SetText("Status: OK")
-	})
+		}()
+	}
 
 	btnCopy := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
-		if activeIsJSON {
-			w.Clipboard().SetContent(jsonOut.Text)
-		} else {
-			w.Clipboard().SetContent(rawOut.Text)
-		}
-		status.SetText("Status: copied")
+		w.Clipboard().SetContent(fullJSON)
+		lblStatus.SetText("Status: copied")
 	})
 
-	btnSave := widget.NewButtonWithIcon("Save…", theme.DocumentSaveIcon(), func() {
-		content := jsonOut.Text
-		if !activeIsJSON {
-			content = rawOut.Text
-		}
-		if strings.TrimSpace(content) == "" {
-			dialog.ShowInformation("Nothing to save", "Output is empty", w)
-			return
-		}
+	btnOpenCache := widget.NewButtonWithIcon("Files", theme.FolderOpenIcon(), func() {
+		// Ensure cache dirs exist so 'open folder' always works even before first decode.
+		_ = ensureDir(cacheDir())
+		_ = ensureDir(cacheMetaDir())
 
-		d := dialog.NewFileSave(func(uc fyne.URIWriteCloser, err error) {
-			if err != nil {
-				dialog.ShowError(err, w)
+		switch sourceTabs.SelectedIndex() {
+		case 0:
+			// File tab: open exact cached file if possible.
+			p := strings.TrimSpace(fileTab.InputPath())
+			p = normalizeLocalPath(p)
+			if p == "" {
+				_ = openFolder(cacheDir())
 				return
 			}
-			if uc == nil {
+			protoAbs := strings.TrimSpace(protoFile.Text)
+			typeName := strings.TrimSpace(typeSelect.Selected())
+			if protoAbs == "" || typeName == "" {
+				_ = openFolder(cacheDir())
 				return
 			}
-			defer func() { _ = uc.Close() }()
-			if _, err := uc.Write([]byte(content)); err != nil {
-				dialog.ShowError(err, w)
-				status.SetText("Status: error")
-				return
-			}
-			status.SetText("Status: saved")
-		}, w)
 
-		if activeIsJSON {
-			d.SetFileName("output.json")
-		} else {
-			d.SetFileName("output.txt")
+			inFI, _ := os.Stat(p)
+			protoFI, _ := os.Stat(protoAbs)
+			key := cacheKey(p, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
+			jsonPath, _ := cachePaths(key)
+			if _, err := os.Stat(jsonPath); err == nil {
+				_ = revealFile(jsonPath)
+				return
+			}
+			_ = openFolder(cacheDir())
+		case 1:
+			// Redis tab: open cache folder; try to select last saved file for selected key.
+			base := "redis"
+			if rk, ok := any(redisTab).(interface{ SelectedKey() string }); ok {
+				if v := strings.TrimSpace(rk.SelectedKey()); v != "" {
+					base = v
+				}
+			}
+			// sanitize like in saveLargeOutput
+			repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", " ", "_")
+			base = repl.Replace(strings.TrimSpace(base))
+			if base == "" {
+				_ = openFolder(cacheDir())
+				return
+			}
+			if len(base) > 80 {
+				base = base[:80]
+			}
+			matches, _ := filepath.Glob(filepath.Join(cacheDir(), base+"-*.json"))
+			if len(matches) == 0 {
+				_ = openFolder(cacheDir())
+				return
+			}
+			// pick newest
+			newest := ""
+			var newestT time.Time
+			for _, m := range matches {
+				fi, err := os.Stat(m)
+				if err != nil {
+					continue
+				}
+				if newest == "" || fi.ModTime().After(newestT) {
+					newest = m
+					newestT = fi.ModTime()
+				}
+			}
+			if newest != "" {
+				_ = revealFile(newest)
+				return
+			}
+			_ = openFolder(cacheDir())
+		default:
+			// Any other tab/state: just open cache folder.
+			_ = openFolder(cacheDir())
 		}
-		d.Show()
 	})
+	btnOpenCache.Importance = widget.LowImportance
 
-	// Хедер результата: сначала GZIP сверху, потом табы слева и toggle справа (в одной линии)
-	gzipRow := container.NewHBox(layout.NewSpacer(), gzipHint, gzipCheck)
-	resultHeader := container.NewVBox(gzipRow, tabsHeader)
+	actions := container.NewHBox(lblStatus, layout.NewSpacer(), container.NewHBox(btnDecode, btnCopy, btnOpenCache))
 
-	// Bottom actions: status on the left, action buttons on the right.
-	actionButtons := container.NewHBox(btnDecode, btnCopy, btnSave)
-	actions := container.NewHBox(status, layout.NewSpacer(), actionButtons)
+	// Output should take all available space.
+	resultPanel := container.NewBorder(resultHeader, actions, nil, nil, outScroll)
 
-	resultPanel := container.NewBorder(resultHeader, actions, nil, nil, contentStack)
+	// Expanded view: output takes the whole window.
+	btnCollapse := widget.NewButtonWithIcon("", theme.ViewRestoreIcon(), nil)
+	btnCollapse.Importance = widget.LowImportance
+	expandedBar := container.NewBorder(nil, nil, nil, btnCollapse, nil)
+	expandedPanel := container.NewBorder(expandedBar, nil, nil, nil, outScroll)
 
 	// Normal layout: source tabs on top, output below
 	normalMid := container.NewBorder(sourceTabs, nil, nil, nil, resultPanel)
-	normalContent := container.NewBorder(globalBar, nil, nil, nil, normalMid)
 
-	// Focus layout: output only (full window)
-	// In expanded mode we still show JSON/RAW tabs; only hide global settings/source selectors.
-	btnToggleMin := btnToggleOutput.MinSize()
-	btnToggleWrap := container.NewGridWrap(btnToggleMin, btnToggleOutput)
-	focusedHeader := container.NewHBox(
-		container.NewHBox(jsonTab, rawTab),
-		layout.NewSpacer(),
-		btnToggleWrap,
-	)
-	focusedContent := container.NewBorder(focusedHeader, nil, nil, nil, contentStack)
+	// Root content holder - we swap only the middle part to avoid heavy relayout.
+	midHolder := container.NewMax()
 
-	// Root that we can swap
-	rootC := container.NewMax(normalContent)
+	setMidNormal := func() {
+		midHolder.Objects = []fyne.CanvasObject{normalMid}
+		midHolder.Refresh()
+	}
+	setMidExpanded := func() {
+		midHolder.Objects = []fyne.CanvasObject{expandedPanel}
+		midHolder.Refresh()
+	}
+
+	setMidNormal()
+
+	// Root
+	normalContent := container.NewBorder(globalBar, nil, nil, nil, midHolder)
 
 	btnToggleOutput.OnTapped = func() {
 		isOutputExpanded = !isOutputExpanded
 		if isOutputExpanded {
 			btnToggleOutput.SetIcon(theme.ViewRestoreIcon())
 			btnToggleOutput.Refresh()
-			rootC.Objects = []fyne.CanvasObject{focusedContent}
+			setMidExpanded()
 		} else {
 			btnToggleOutput.SetIcon(theme.ViewFullScreenIcon())
 			btnToggleOutput.Refresh()
-			rootC.Objects = []fyne.CanvasObject{normalContent}
+			setMidNormal()
 		}
-		rootC.Refresh()
 	}
+	btnCollapse.OnTapped = func() {
+		isOutputExpanded = false
+		btnToggleOutput.SetIcon(theme.ViewFullScreenIcon())
+		btnToggleOutput.Refresh()
+		setMidNormal()
+	}
+
+	// Root that we can return
+	rootC := normalContent
 
 	// ---- Drag & Drop -> заполняем File tab
 	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
@@ -725,11 +1065,9 @@ func build(w fyne.Window) fyne.CanvasObject {
 			p = u.String()
 		}
 		if p == "" {
-			status.SetText("Status: drop ignored (empty path)")
 			return
 		}
 
-		status.SetText("Status: dropped " + p)
 		sourceTabs.SelectIndex(0)
 		fileTab.SetFilePath(p)
 		fileTab.FlashDropHighlight()

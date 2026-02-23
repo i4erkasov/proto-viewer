@@ -10,7 +10,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/i4erkasov/proto-viewer/internal/application/components"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/dropzone"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/repository"
 )
 
@@ -22,7 +22,7 @@ type FileTab struct {
 	pathOrURL *widget.Entry
 	browse    *widget.Button
 	clear     *widget.Button
-	dropZone  *components.DropZone
+	dropZone  *dropzone.DropZone
 
 	root fyne.CanvasObject
 }
@@ -67,7 +67,7 @@ func NewTabFile(w fyne.Window) *FileTab {
 
 	rightButtons := container.NewHBox(clearWrap, browseWrap)
 
-	drop := components.NewDropZone("Drop a .bin/.gz file here (or click the folder button)")
+	drop := dropzone.New("Drop a .bin/.gz file here (or click the folder button)")
 	t.dropZone = drop
 
 	// layout: VBox как в других вкладках
@@ -109,4 +109,13 @@ func (t *FileTab) LastHTTPWasGzipped() bool { return t.repo.LastHTTPWasGzipped()
 func (t *FileTab) LastInputLooksGzip() bool { return t.repo.LastInputLooksGzip() }
 func (t *FileTab) SetFilePath(p string) {
 	t.pathOrURL.SetText(p)
+}
+
+// InputPath returns current user input (path or URL) as-is.
+// Used by upper layers (layout) for cache decisions.
+func (t *FileTab) InputPath() string {
+	if t == nil || t.pathOrURL == nil {
+		return ""
+	}
+	return t.pathOrURL.Text
 }

@@ -1,4 +1,4 @@
-package components
+package dropzone
 
 import (
 	"image/color"
@@ -21,7 +21,7 @@ type DropZone struct {
 	highlight bool
 }
 
-func NewDropZone(text string) *DropZone {
+func New(text string) *DropZone {
 	d := &DropZone{Text: text}
 	d.ExtendBaseWidget(d)
 	return d
@@ -52,10 +52,10 @@ func (d *DropZone) CreateRenderer() fyne.WidgetRenderer {
 	label.TextStyle = fyne.TextStyle{Bold: true}
 
 	objects := []fyne.CanvasObject{bg, icon, label}
-	return &dropZoneRenderer{d: d, bg: bg, icon: icon, label: label, objects: objects}
+	return &renderer{d: d, bg: bg, icon: icon, label: label, objects: objects}
 }
 
-type dropZoneRenderer struct {
+type renderer struct {
 	d       *DropZone
 	bg      *canvas.Rectangle
 	icon    *widget.Icon
@@ -63,8 +63,7 @@ type dropZoneRenderer struct {
 	objects []fyne.CanvasObject
 }
 
-func (r *dropZoneRenderer) Layout(size fyne.Size) {
-	// Небольшие внутренние отступы
+func (r *renderer) Layout(size fyne.Size) {
 	pad := float32(12)
 
 	r.bg.Resize(size)
@@ -78,7 +77,6 @@ func (r *dropZoneRenderer) Layout(size fyne.Size) {
 		contentH = 0
 	}
 
-	// Center icon + text внутри padded области
 	iconSize := float32(48)
 	r.icon.Resize(fyne.NewSize(iconSize, iconSize))
 
@@ -96,11 +94,11 @@ func (r *dropZoneRenderer) Layout(size fyne.Size) {
 	r.label.Resize(fyne.NewSize(contentW, labelMin.Height))
 }
 
-func (r *dropZoneRenderer) MinSize() fyne.Size {
+func (r *renderer) MinSize() fyne.Size {
 	return fyne.NewSize(320, 160)
 }
 
-func (r *dropZoneRenderer) Refresh() {
+func (r *renderer) Refresh() {
 	r.label.Text = r.d.Text
 
 	if r.d.highlight {
@@ -114,5 +112,5 @@ func (r *dropZoneRenderer) Refresh() {
 	r.bg.Refresh()
 }
 
-func (r *dropZoneRenderer) Objects() []fyne.CanvasObject { return r.objects }
-func (r *dropZoneRenderer) Destroy()                     {}
+func (r *renderer) Objects() []fyne.CanvasObject { return r.objects }
+func (r *renderer) Destroy()                     {}

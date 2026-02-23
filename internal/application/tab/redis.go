@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/i4erkasov/proto-viewer/internal/application/components/colorbutton"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/colorbutton"
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/repository"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/secret"
@@ -27,6 +27,7 @@ const (
 	prefRedisUsername     = "redis.username"
 	prefRedisSavePassword = "redis.savePassword"
 	prefRedisPassEnc      = "redis.passwordEnc"
+	prefRedisGzip         = "redis.gzip"
 )
 
 type RedisTab struct {
@@ -63,6 +64,8 @@ type RedisTab struct {
 	connected bool
 
 	root fyne.CanvasObject
+
+	gzipCheck *widget.Check
 }
 
 func NewTabRedis(w fyne.Window) *RedisTab {
@@ -145,6 +148,13 @@ func NewTabRedis(w fyne.Window) *RedisTab {
 	t.port.OnChanged = func(s string) { prefs.SetString(prefRedisPort, strings.TrimSpace(s)) }
 	t.user.OnChanged = func(s string) { prefs.SetString(prefRedisUsername, strings.TrimSpace(s)) }
 
+	// GZIP checkbox placed after Key selector.
+	t.gzipCheck = widget.NewCheck("GZIP compressed", func(checked bool) {
+		prefs.SetBool(prefRedisGzip, checked)
+	})
+	t.gzipCheck.SetChecked(prefs.Bool(prefRedisGzip))
+	gzipWrap := container.NewGridWrap(t.gzipCheck.MinSize(), t.gzipCheck)
+
 	// --- Row 1: Host / Port / TLS
 	entryH := t.host.MinSize().Height
 	hostWrap := container.NewGridWrap(fyne.NewSize(260, entryH), t.host)
@@ -185,6 +195,7 @@ func NewTabRedis(w fyne.Window) *RedisTab {
 	selectorsRow := container.NewHBox(
 		widget.NewLabel("DB:"), dbWrap,
 		widget.NewLabel("Key:"), keyWrap,
+		gzipWrap,
 		t.fieldLabel, fieldWrap,
 	)
 
@@ -554,6 +565,14 @@ func (t *RedisTab) onKeySelected(k string) {
 	}()
 }
 
+// Gzip returns current GZIP checkbox state.
+func (t *RedisTab) Gzip() bool {
+	if t.gzipCheck == nil {
+		return false
+	}
+	return t.gzipCheck.Checked
+}
+
 func (t *RedisTab) Fetch(ctx context.Context) ([]byte, error) {
 	cfg, err := t.cfg()
 	if err != nil {
@@ -574,4 +593,12 @@ func (t *RedisTab) Fetch(ctx context.Context) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("unsupported redis key type: %s", t.keyType)
 	}
+}
+
+// SelectedKey returns currently selected Redis key (empty if none).
+func (t *RedisTab) SelectedKey() string {
+	if t == nil {
+		return ""
+	}
+	return strings.TrimSpace(t.selectedKey)
 }
