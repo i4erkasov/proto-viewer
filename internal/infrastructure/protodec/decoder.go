@@ -79,6 +79,7 @@ func compileDescriptorSet(ctx context.Context, protoRoot, protoAbs string) (*des
 		relProto,
 	}
 	cmd := exec.CommandContext(ctx, protocPath, args...)
+	hideWindow(cmd)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
 	if err := cmd.Run(); err != nil {
@@ -169,6 +170,7 @@ func decodeRaw(ctx context.Context, binBytes []byte) (string, error) {
 		return "", err
 	}
 	cmd := exec.CommandContext(ctx, protocPath, "--decode_raw")
+	hideWindow(cmd)
 	cmd.Stdin = bytes.NewReader(binBytes)
 
 	var out bytes.Buffer

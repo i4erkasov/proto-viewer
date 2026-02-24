@@ -80,7 +80,7 @@ jobs:
           # Use absolute icon path to avoid any working directory / source-dir confusion.
           $icon = (Resolve-Path "assets/icon.png").Path
           Write-Host "Using icon: $icon ($(Get-Item $icon).Length bytes)"
-          fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon
+          fyne package --os windows --source-dir $src --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon $icon --ldflags "-H=windowsgui"
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
