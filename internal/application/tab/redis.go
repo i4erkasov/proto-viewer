@@ -602,3 +602,19 @@ func (t *RedisTab) SelectedKey() string {
 	}
 	return strings.TrimSpace(t.selectedKey)
 }
+
+// SelectedField returns currently selected hash field (empty if none).
+func (t *RedisTab) SelectedField() string {
+	if t == nil {
+		return ""
+	}
+	return strings.TrimSpace(t.selectedField)
+}
+
+// SelectedDB returns currently selected DB index.
+func (t *RedisTab) SelectedDB() int {
+	if t == nil {
+		return 0
+	}
+	return t.selectedDB
+}

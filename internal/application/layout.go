@@ -20,6 +20,8 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/jsonmarkdown"
+	"github.com/i4erkasov/proto-viewer/internal/application/widgets/jsontree"
 	"github.com/i4erkasov/proto-viewer/internal/application/widgets/protopicker"
 	"github.com/i4erkasov/proto-viewer/internal/application/widgets/searchselect"
 
@@ -52,15 +54,6 @@ func build(w fyne.Window) fyne.CanvasObject {
 	protoTypeCache.items = make(map[string]protoTypeCacheEntry)
 
 	// Helpers
-	splitLines := func(s string) []string {
-		s = strings.ReplaceAll(s, "\r\n", "\n")
-		s = strings.ReplaceAll(s, "\r", "\n")
-		if s == "" {
-			return nil
-		}
-		return strings.Split(s, "\n")
-	}
-
 	openFolder := func(p string) error {
 		if p == "" {
 			return fmt.Errorf("empty path")
@@ -81,33 +74,51 @@ func build(w fyne.Window) fyne.CanvasObject {
 
 	// Keep full outputs in memory (UI shows preview for large payloads).
 	var fullJSON string
-	var fullLines []string
 
-	// Output widget (lazy-loaded)
-	outText := widget.NewRichTextWithText("")
-	outText.Wrapping = fyne.TextWrapWord
-	outScroll := container.NewScroll(outText)
+	// Output widget (JSON tree + markdown)
+	jsonTree := jsontree.NewSearchableJSONTree()
+	jsonMarkdown := jsonmarkdown.NewJSONMarkdownView()
 
-	const initialLines = 200
-	const linesPerChunk = 400
-	const loadMoreThresholdPx float32 = 120
-	var visibleLines int
-	var inLoadMore bool
-	var loadMore func()
+	outTree := jsonTree.View()
+	outMarkdown := jsonMarkdown.View()
+	searchWrap := jsonTree.SearchBar()
 
-	updateStatusLoaded := func() {
-		if len(fullLines) == 0 {
-			return
-		}
-		lblStatus.SetText(fmt.Sprintf("Status: OK (%d/%d lines)", visibleLines, len(fullLines)))
+	// Let header decide width; keep same behavior as before.
+	jsonTree.SetSearchWidth(420)
+
+	var resultPanel *fyne.Container
+	var isOutputExpanded bool
+
+	outputTabs := container.NewAppTabs(
+		container.NewTabItem("JSON", outMarkdown),
+		container.NewTabItem("Tree", outTree),
+	)
+	outputTabs.SetTabLocation(container.TabLocationTop)
+
+	isTreeTab := func() bool {
+		return outputTabs.SelectedIndex() == 1
 	}
 
-	setOutput := func(s string) {
-		fullLines = splitLines(s)
-		visibleLines = 0
-		if loadMore != nil {
-			loadMore()
+	setSearchVisible := func(show bool) {
+		if show && !isTreeTab() {
+			return
 		}
+		jsonTree.SetSearchVisible(show)
+		if resultPanel != nil {
+			resultPanel.Refresh()
+		}
+		if show {
+			w.Canvas().Focus(jsonTree.SearchEntry())
+		}
+	}
+
+	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
+	setSearchVisible(false)
+
+	setOutput := func(s string) {
+		fullJSON = s
+		jsonTree.SetJSON(s)
+		jsonMarkdown.SetJSON(s)
 
 		// If we have output to show, grow window height a bit (once per setOutput call)
 		// so users can see more lines without manual resize.
@@ -126,43 +137,10 @@ func build(w fyne.Window) fyne.CanvasObject {
 		})
 	}
 
-	loadMore = func() {
-		if inLoadMore {
-			return
-		}
-		if visibleLines >= len(fullLines) {
-			return
-		}
-		inLoadMore = true
-		defer func() { inLoadMore = false }()
-
-		next := visibleLines
-		if next == 0 {
-			next = initialLines
-		} else {
-			next = visibleLines + linesPerChunk
-		}
-		if next > len(fullLines) {
-			next = len(fullLines)
-		}
-		visibleLines = next
-		outText.ParseMarkdown("```json\n" + strings.Join(fullLines[:visibleLines], "\n") + "\n```")
-		outText.Refresh()
-		updateStatusLoaded()
-	}
-
-	outScroll.OnScrolled = func(pos fyne.Position) {
-		viewH := outScroll.Size().Height
-		if viewH <= 0 {
-			return
-		}
-		contentH := outText.MinSize().Height
-		if contentH <= viewH {
-			return
-		}
-		if pos.Y+viewH >= contentH-loadMoreThresholdPx {
-			loadMore()
-		}
+	clearOutput := func() {
+		fullJSON = ""
+		jsonTree.SetJSON("")
+		jsonMarkdown.SetJSON("")
 	}
 
 	// ---- Decode output cache (File tab / local files only)
@@ -206,56 +184,17 @@ func build(w fyne.Window) fyne.CanvasObject {
 		return filepath.Join(cacheDir(), "meta")
 	}
 
+	cachePaths := func(key string) (jsonPath, metaPath string) {
+		jsonPath = filepath.Join(cacheDir(), key+".json")
+		metaPath = filepath.Join(cacheMetaDir(), key+".meta.json")
+		return
+	}
+
 	ensureDir := func(dir string) error {
 		if dir == "" {
 			return fmt.Errorf("empty dir")
 		}
 		return os.MkdirAll(dir, 0o755)
-	}
-
-	// Try to reveal a file in OS file manager (select the file).
-	revealFile := func(p string) error {
-		if p == "" {
-			return fmt.Errorf("empty path")
-		}
-		switch runtime.GOOS {
-		case "darwin":
-			return exec.Command("open", "-R", p).Start()
-		case "windows":
-			return exec.Command("explorer", "/select,", p).Start()
-		default:
-			// Most linux file managers don't have stable select flag; open folder.
-			return openFolder(p)
-		}
-	}
-
-	cacheKey := func(inputPath, protoFileAbs, msgType string, gzip bool, inFI, protoFI os.FileInfo) string {
-		h := sha256.New()
-		_, _ = h.Write([]byte(inputPath))
-		_, _ = h.Write([]byte("\n"))
-		_, _ = h.Write([]byte(protoFileAbs))
-		_, _ = h.Write([]byte("\n"))
-		_, _ = h.Write([]byte(msgType))
-		_, _ = h.Write([]byte("\n"))
-		if gzip {
-			_, _ = h.Write([]byte("gzip=1\n"))
-		} else {
-			_, _ = h.Write([]byte("gzip=0\n"))
-		}
-		if inFI != nil {
-			_, _ = h.Write([]byte(fmt.Sprintf("in_mtime=%d in_size=%d\n", inFI.ModTime().UnixNano(), inFI.Size())))
-		}
-		if protoFI != nil {
-			_, _ = h.Write([]byte(fmt.Sprintf("proto_mtime=%d proto_size=%d\n", protoFI.ModTime().UnixNano(), protoFI.Size())))
-		}
-		sum := h.Sum(nil)
-		return fmt.Sprintf("%x", sum)
-	}
-
-	cachePaths := func(key string) (jsonPath, metaPath string) {
-		jsonPath = filepath.Join(cacheDir(), key+".json")
-		metaPath = filepath.Join(cacheMetaDir(), key+".meta.json")
-		return
 	}
 
 	readCacheIfFresh := func(key string) (jsonText string, ok bool, _ error) {
@@ -306,33 +245,62 @@ func build(w fyne.Window) fyne.CanvasObject {
 		return jsonPath, nil
 	}
 
-	// For non-file sources (e.g. Redis) we still want to save large outputs for удобства.
-	// File name: based on key + timestamp.
-	saveLargeOutput := func(baseName, jsonText string) (string, error) {
-		if err := ensureDir(cacheDir()); err != nil {
-			return "", err
+	// Try to reveal a file in OS file manager (select the file).
+	revealFile := func(p string) error {
+		if p == "" {
+			return fmt.Errorf("empty path")
 		}
-		baseName = strings.TrimSpace(baseName)
-		if baseName == "" {
-			baseName = "output"
+		switch runtime.GOOS {
+		case "darwin":
+			return exec.Command("open", "-R", p).Start()
+		case "windows":
+			return exec.Command("explorer", "/select,", p).Start()
+		default:
+			// Most linux file managers don't have stable select flag; open folder.
+			return openFolder(p)
 		}
-		// sanitize for filesystem
-		repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", " ", "_")
-		baseName = repl.Replace(baseName)
-		if len(baseName) > 80 {
-			baseName = baseName[:80]
+	}
+
+	cacheKey := func(inputPath, protoFileAbs, msgType string, gzip bool, inFI, protoFI os.FileInfo) string {
+		h := sha256.New()
+		_, _ = h.Write([]byte(inputPath))
+		_, _ = h.Write([]byte("\n"))
+		_, _ = h.Write([]byte(protoFileAbs))
+		_, _ = h.Write([]byte("\n"))
+		_, _ = h.Write([]byte(msgType))
+		_, _ = h.Write([]byte("\n"))
+		if gzip {
+			_, _ = h.Write([]byte("gzip=1\n"))
+		} else {
+			_, _ = h.Write([]byte("gzip=0\n"))
 		}
-		ts := time.Now().Format("20060102-150405")
-		path := filepath.Join(cacheDir(), fmt.Sprintf("%s-%s.json", baseName, ts))
-		// atomic write
-		tmp := path + ".tmp"
-		if err := os.WriteFile(tmp, []byte(jsonText), 0o644); err != nil {
-			return "", err
+		if inFI != nil {
+			_, _ = h.Write([]byte(fmt.Sprintf("in_mtime=%d in_size=%d\n", inFI.ModTime().UnixNano(), inFI.Size())))
 		}
-		if err := os.Rename(tmp, path); err != nil {
-			return "", err
+		if protoFI != nil {
+			_, _ = h.Write([]byte(fmt.Sprintf("proto_mtime=%d proto_size=%d\n", protoFI.ModTime().UnixNano(), protoFI.Size())))
 		}
-		return path, nil
+		sum := h.Sum(nil)
+		return fmt.Sprintf("%x", sum)
+	}
+
+	redisCacheKey := func(db int, key, field, protoFileAbs, msgType string, gzip bool, payload []byte) string {
+		h := sha256.New()
+		_, _ = h.Write([]byte(fmt.Sprintf("redis-db=%d\n", db)))
+		_, _ = h.Write([]byte("redis-key=" + key + "\n"))
+		_, _ = h.Write([]byte("redis-field=" + field + "\n"))
+		_, _ = h.Write([]byte("proto-file=" + protoFileAbs + "\n"))
+		_, _ = h.Write([]byte("msg-type=" + msgType + "\n"))
+		if gzip {
+			_, _ = h.Write([]byte("gzip=1\n"))
+		} else {
+			_, _ = h.Write([]byte("gzip=0\n"))
+		}
+		if len(payload) > 0 {
+			sum := sha256.Sum256(payload)
+			_, _ = h.Write([]byte(fmt.Sprintf("payload=%x\n", sum)))
+		}
+		return fmt.Sprintf("%x", h.Sum(nil))
 	}
 
 	// ---- Global settings (shared)
@@ -424,6 +392,12 @@ func build(w fyne.Window) fyne.CanvasObject {
 		container.NewTabItem(redisTab.Title(), container.NewBorder(redisTab.View(), nil, nil, nil, nil)),
 	)
 	sourceTabs.SetTabLocation(container.TabLocationTop)
+
+	sourceTabs.OnSelected = func(item *container.TabItem) {
+		if item != nil && item.Text == redisTab.Title() {
+			clearOutput()
+		}
+	}
 
 	// --- buttons
 	btnAutoDetect := widget.NewButton("Auto-detect type", func() {
@@ -705,18 +679,33 @@ func build(w fyne.Window) fyne.CanvasObject {
 	// remove unused local status label (we use lblStatus already)
 
 	// Expand/collapse output
-	var isOutputExpanded bool
 	btnToggleOutput := widget.NewButtonWithIcon("", theme.ViewFullScreenIcon(), nil)
 	btnToggleOutput.Importance = widget.LowImportance
 
-	// Header: only toggle on the right (no global gzip row)
-	resultHeader := container.NewBorder(nil, nil, nil, btnToggleOutput, nil)
+	btnCollapse := widget.NewButtonWithIcon("", theme.ViewRestoreIcon(), nil)
+	btnCollapse.Importance = widget.LowImportance
+	btnCollapse.Hide()
+
+	// Overlay buttons (same spot) so we don't reparent output tabs.
+	overlayButtons := container.NewStack(btnToggleOutput, btnCollapse)
+	btnOverlay := container.NewVBox(
+		container.NewBorder(nil, nil, nil, overlayButtons, layout.NewSpacer()),
+		layout.NewSpacer(),
+	)
+	searchOverlay := container.NewVBox(
+		container.NewPadded(searchWrap),
+		layout.NewSpacer(),
+	)
+	outputStack := container.NewStack(outputTabs, btnOverlay, searchOverlay)
+
+	// Header removed: search is now overlaid on output.
 
 	// Decode button (wiring TODO - placeholder to keep layout stable)
 	btnDecode := widget.NewButtonWithIcon("Decode", theme.ViewRefreshIcon(), nil)
 	btnDecode.Importance = widget.MediumImportance
 	btnDecode.OnTapped = func() {
 		lblStatus.SetText("Status: decoding…")
+		clearOutput()
 		noteTypeError("")
 
 		root := strings.TrimSpace(protoRoot.Text)
@@ -789,6 +778,12 @@ func build(w fyne.Window) fyne.CanvasObject {
 			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer cancel()
 
+			if sourceTabs.SelectedIndex() == 1 {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: loading from Redis…")
+				})
+			}
+
 			payload, err := src.Fetch(ctx)
 			if err != nil {
 				fyne.Do(func() {
@@ -796,6 +791,36 @@ func build(w fyne.Window) fyne.CanvasObject {
 					dialog.ShowError(err, w)
 				})
 				return
+			}
+
+			// Redis cache based on key + field + content hash (before decode).
+			if sourceTabs.SelectedIndex() == 1 {
+				key := ""
+				field := ""
+				db := 0
+				if rk, ok := any(redisTab).(interface{ SelectedKey() string }); ok {
+					key = strings.TrimSpace(rk.SelectedKey())
+				}
+				if rf, ok := any(redisTab).(interface{ SelectedField() string }); ok {
+					field = strings.TrimSpace(rf.SelectedField())
+				}
+				if rd, ok := any(redisTab).(interface{ SelectedDB() int }); ok {
+					db = rd.SelectedDB()
+				}
+
+				if key != "" {
+					protoAbs := strings.TrimSpace(protoFile.Text)
+					msgType := strings.TrimSpace(typeSelect.Selected())
+					keyHash := redisCacheKey(db, key, field, protoAbs, msgType, gzipCheck.Checked, payload)
+					if cached, ok, _ := readCacheIfFresh(keyHash); ok {
+						fyne.Do(func() {
+							fullJSON = cached
+							setOutput(fullJSON)
+							lblStatus.SetText("Status: OK (from cache)")
+						})
+						return
+					}
+				}
 			}
 
 			res, err := dec.Decode(ctx, domain.DecodeRequest{
@@ -845,16 +870,31 @@ func build(w fyne.Window) fyne.CanvasObject {
 				}
 			}
 
-			// For Redis (and other non-file sources) also save large outputs to a file.
-			if cachedPath == "" && sourceTabs.SelectedIndex() == 1 {
-				k := "redis"
+			// Cache for Redis using content hash.
+			if sourceTabs.SelectedIndex() == 1 {
+				key := ""
+				field := ""
+				db := 0
 				if rk, ok := any(redisTab).(interface{ SelectedKey() string }); ok {
-					if v := strings.TrimSpace(rk.SelectedKey()); v != "" {
-						k = v
-					}
+					key = strings.TrimSpace(rk.SelectedKey())
 				}
-				if p, err := saveLargeOutput(k, jsonText); err == nil {
-					cachedPath = p
+				if rf, ok := any(redisTab).(interface{ SelectedField() string }); ok {
+					field = strings.TrimSpace(rf.SelectedField())
+				}
+				if rd, ok := any(redisTab).(interface{ SelectedDB() int }); ok {
+					db = rd.SelectedDB()
+				}
+				if key != "" {
+					protoAbs := strings.TrimSpace(protoFile.Text)
+					msgType := strings.TrimSpace(typeSelect.Selected())
+					keyHash := redisCacheKey(db, key, field, protoAbs, msgType, gzipCheck.Checked, payload)
+					meta := decodeCacheMeta{
+						InputPath:   "redis://" + key,
+						MessageType: msgType,
+						ProtoFile:   protoAbs,
+						Gzip:        gzipCheck.Checked,
+					}
+					_, _ = writeCache(keyHash, meta, jsonText)
 				}
 			}
 
@@ -999,51 +1039,50 @@ func build(w fyne.Window) fyne.CanvasObject {
 	actions := container.NewHBox(lblStatus, layout.NewSpacer(), container.NewHBox(btnDecode, btnCopy, btnOpenCache))
 
 	// Output should take all available space.
-	resultPanel := container.NewBorder(resultHeader, actions, nil, nil, outScroll)
+	resultPanel = container.NewBorder(nil, actions, nil, nil, outputStack)
 
-	// Expanded view: output takes the whole window.
-	btnCollapse := widget.NewButtonWithIcon("", theme.ViewRestoreIcon(), nil)
-	btnCollapse.Importance = widget.LowImportance
-	expandedBar := container.NewBorder(nil, nil, nil, btnCollapse, nil)
-	expandedPanel := container.NewBorder(expandedBar, nil, nil, nil, outScroll)
-
-	// Normal layout: source tabs on top, output below
-	normalMid := container.NewBorder(sourceTabs, nil, nil, nil, resultPanel)
-
-	// Root content holder - we swap only the middle part to avoid heavy relayout.
-	midHolder := container.NewMax()
-
-	setMidNormal := func() {
-		midHolder.Objects = []fyne.CanvasObject{normalMid}
-		midHolder.Refresh()
-	}
-	setMidExpanded := func() {
-		midHolder.Objects = []fyne.CanvasObject{expandedPanel}
-		midHolder.Refresh()
+	outputTabs.OnSelected = func(_ *container.TabItem) {
+		if !isTreeTab() {
+			setSearchVisible(false)
+		}
 	}
 
-	setMidNormal()
+	// Layout: keep outputStack in a single container to avoid reparenting issues.
+	contentArea := container.NewBorder(sourceTabs, nil, nil, nil, resultPanel)
 
 	// Root
-	normalContent := container.NewBorder(globalBar, nil, nil, nil, midHolder)
+	normalContent := container.NewBorder(globalBar, nil, nil, nil, contentArea)
 
 	btnToggleOutput.OnTapped = func() {
 		isOutputExpanded = !isOutputExpanded
 		if isOutputExpanded {
-			btnToggleOutput.SetIcon(theme.ViewRestoreIcon())
-			btnToggleOutput.Refresh()
-			setMidExpanded()
+			setSearchVisible(false)
+			btnToggleOutput.Hide()
+			btnCollapse.Show()
+			globalBar.Hide()
+			sourceTabs.Hide()
+			actions.Hide()
+			contentArea.Refresh()
+			normalContent.Refresh()
 		} else {
-			btnToggleOutput.SetIcon(theme.ViewFullScreenIcon())
-			btnToggleOutput.Refresh()
-			setMidNormal()
+			btnCollapse.Hide()
+			btnToggleOutput.Show()
+			globalBar.Show()
+			sourceTabs.Show()
+			actions.Show()
+			contentArea.Refresh()
+			normalContent.Refresh()
 		}
 	}
 	btnCollapse.OnTapped = func() {
 		isOutputExpanded = false
-		btnToggleOutput.SetIcon(theme.ViewFullScreenIcon())
-		btnToggleOutput.Refresh()
-		setMidNormal()
+		btnCollapse.Hide()
+		btnToggleOutput.Show()
+		globalBar.Show()
+		sourceTabs.Show()
+		actions.Show()
+		contentArea.Refresh()
+		normalContent.Refresh()
 	}
 
 	// Root that we can return
@@ -1075,3 +1114,5 @@ func build(w fyne.Window) fyne.CanvasObject {
 
 	return rootC
 }
+
+// (shortcut helpers moved to platform-specific files)
