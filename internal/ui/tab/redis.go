@@ -8,10 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/i4erkasov/proto-viewer/internal/application/widgets/colorbutton"
 	"github.com/i4erkasov/proto-viewer/internal/domain"
-	"github.com/i4erkasov/proto-viewer/internal/infrastructure/repository"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/secret"
+	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/colorbutton"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -68,8 +67,8 @@ type RedisTab struct {
 	gzipCheck *widget.Check
 }
 
-func NewTabRedis(w fyne.Window) *RedisTab {
-	t := &RedisTab{w: w, repo: repository.NewRedis()}
+func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
+	t := &RedisTab{w: w, repo: repo}
 
 	prefs := fyne.CurrentApp().Preferences()
 

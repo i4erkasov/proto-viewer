@@ -30,11 +30,17 @@ type SearchableJSONTree struct {
 	searchIndex  map[string][]string
 	searchAllIDs []string
 
+	matchIDs   []string
+	matchIndex int
+
 	tree   *widget.Tree
 	scroll *container.Scroll
 
 	searchEntry *escEntry
+	searchUp    *widget.Button
+	searchDown  *widget.Button
 	searchWrap  *fyne.Container
+	searchWidth float32
 
 	debounceMu    sync.Mutex
 	debounceTimer *time.Timer
@@ -48,6 +54,7 @@ type jsonTreeNode struct {
 	parent     string
 	searchText string
 	tokens     []string
+	height     int
 }
 
 // NewSearchableJSONTree creates a JSON tree widget with an embedded search bar.
@@ -72,16 +79,29 @@ func NewSearchableJSONTree() *SearchableJSONTree {
 	jt.searchEntry = newEscEntry()
 	jt.searchEntry.SetPlaceHolder("Search output")
 	jt.searchEntry.OnChanged = jt.onSearchChanged
+	jt.searchEntry.OnSubmitted = func(_ string) {
+		jt.navigateMatch(1)
+	}
 	jt.searchEntry.SetOnEsc(func() {
 		if jt.SearchVisible() {
 			jt.SetSearchVisible(false)
 		}
 	})
 
+	jt.searchUp = widget.NewButton("▲", func() {
+		jt.navigateMatch(-1)
+	})
+	jt.searchDown = widget.NewButton("▼", func() {
+		jt.navigateMatch(1)
+	})
+	jt.searchUp.Disable()
+	jt.searchDown.Disable()
+
 	jt.searchWrap = container.NewGridWrap(
 		fyne.NewSize(420, jt.searchEntry.MinSize().Height),
-		jt.searchEntry,
+		container.NewHBox(jt.searchEntry, jt.searchUp, jt.searchDown),
 	)
+	jt.searchWidth = 420
 	jt.searchWrap.Hide()
 
 	return jt
@@ -104,7 +124,25 @@ func (jt *SearchableJSONTree) SearchEntry() *widget.Entry {
 
 // SetSearchWidth sets a fixed width for the search input wrapper.
 func (jt *SearchableJSONTree) SetSearchWidth(w float32) {
-	jt.searchWrap.Objects = []fyne.CanvasObject{jt.searchEntry}
+	if w <= 0 {
+		return
+	}
+	jt.searchWidth = w
+	btnW := jt.searchUp.MinSize().Width + jt.searchDown.MinSize().Width + theme.Padding()*2
+	entryW := w - btnW
+	if entryW < jt.searchEntry.MinSize().Width {
+		entryW = jt.searchEntry.MinSize().Width
+	}
+
+	entryWrap := container.NewGridWrap(
+		fyne.NewSize(entryW, jt.searchEntry.MinSize().Height),
+		jt.searchEntry,
+	)
+	row := container.NewHBox(entryWrap, jt.searchUp, jt.searchDown)
+	row.Resize(fyne.NewSize(w, jt.searchEntry.MinSize().Height))
+	row.Refresh()
+
+	jt.searchWrap.Objects = []fyne.CanvasObject{row}
 	jt.searchWrap.Resize(fyne.NewSize(w, jt.searchEntry.MinSize().Height))
 	jt.searchWrap.Refresh()
 }
@@ -112,6 +150,7 @@ func (jt *SearchableJSONTree) SetSearchWidth(w float32) {
 // SetSearchVisible shows or hides the search bar and clears query when hidden.
 func (jt *SearchableJSONTree) SetSearchVisible(show bool) {
 	if show {
+		jt.SetSearchWidth(jt.searchWidth)
 		jt.searchWrap.Show()
 		jt.searchWrap.Refresh()
 		return
@@ -133,6 +172,8 @@ func (jt *SearchableJSONTree) SetJSON(jsonText string) {
 	jt.treeVisible = nil
 	jt.treeMatches = nil
 	jt.treeQuery = ""
+	jt.matchIDs = nil
+	jt.matchIndex = -1
 	jt.SetSearchVisible(false)
 
 	if strings.TrimSpace(jsonText) == "" {
@@ -258,6 +299,22 @@ func (jt *SearchableJSONTree) buildTree(id, key, parent string, v any) {
 	default:
 		n.value = formatScalar(t)
 	}
+	maxH := -1
+	for _, c := range n.children {
+		cn := jt.treeNodes[c]
+		if cn == nil {
+			continue
+		}
+		if cn.height > maxH {
+			maxH = cn.height
+		}
+	}
+	if maxH < 0 {
+		n.height = 0
+	} else {
+		n.height = maxH + 1
+	}
+
 	n.searchText = strings.ToLower(strings.TrimSpace(n.key + " " + n.value))
 	n.tokens = tokenizeQuery(n.searchText)
 	jt.treeNodes[id] = n
@@ -305,25 +362,58 @@ func (jt *SearchableJSONTree) applyTreeFilter(q string) {
 	if q == "" {
 		jt.treeVisible = nil
 		jt.treeMatches = nil
+		jt.matchIDs = nil
+		jt.matchIndex = -1
+		jt.updateNavButtons()
 		jt.tree.Refresh()
 		return
 	}
 	vis := make(map[string]bool)
 	match := make(map[string]bool)
+	matchedContainers := make(map[string]bool)
 
-	var markDescendants func(string)
-	markDescendants = func(id string) {
-		n := jt.treeNodes[id]
-		if n == nil {
-			return
-		}
-		for _, c := range n.children {
-			if vis[c] {
+	markDescendants := func(start string) {
+		stack := []string{start}
+		for len(stack) > 0 {
+			id := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+
+			if !vis[id] {
+				vis[id] = true
+			}
+
+			n := jt.treeNodes[id]
+			if n == nil {
 				continue
 			}
-			vis[c] = true
-			markDescendants(c)
+			stack = append(stack, n.children...)
 		}
+	}
+
+	markPath := func(id string) {
+		cur := id
+		for cur != "" {
+			vis[cur] = true
+			n := jt.treeNodes[cur]
+			if n == nil {
+				break
+			}
+			cur = n.parent
+		}
+	}
+
+	selectContainer := func(id string) string {
+		n := jt.treeNodes[id]
+		if n == nil {
+			return id
+		}
+		if len(n.children) > 0 {
+			return id
+		}
+		if n.parent != "" {
+			return n.parent
+		}
+		return id
 	}
 
 	candidates := jt.searchAllIDs
@@ -353,6 +443,7 @@ func (jt *SearchableJSONTree) applyTreeFilter(q string) {
 		}
 	}
 
+	jt.matchIDs = jt.matchIDs[:0]
 	for _, id := range candidates {
 		n := jt.treeNodes[id]
 		if n == nil {
@@ -361,18 +452,39 @@ func (jt *SearchableJSONTree) applyTreeFilter(q string) {
 		if !matchNode(n, q, qTokens) {
 			continue
 		}
+		jt.matchIDs = append(jt.matchIDs, id)
 		match[id] = true
-		cur := id
-		for cur != "" {
-			vis[cur] = true
-			pn := jt.treeNodes[cur]
-			if pn == nil {
-				break
-			}
-			cur = pn.parent
-		}
+		markPath(id)
+
+		containerID := selectContainer(id)
+		matchedContainers[containerID] = true
+	}
+
+	for id := range matchedContainers {
 		markDescendants(id)
 	}
+
+	visibleIDs := make([]string, 0, len(vis))
+	for id := range vis {
+		visibleIDs = append(visibleIDs, id)
+	}
+	for _, id := range visibleIDs {
+		n := jt.treeNodes[id]
+		if n == nil {
+			continue
+		}
+		if n.height <= 2 {
+			markDescendants(id)
+		}
+	}
+
+	sort.Strings(jt.matchIDs)
+	if len(jt.matchIDs) == 0 {
+		jt.matchIndex = -1
+	} else if jt.matchIndex < 0 || jt.matchIndex >= len(jt.matchIDs) {
+		jt.matchIndex = 0
+	}
+	jt.updateNavButtons()
 	jt.treeVisible = vis
 	jt.treeMatches = match
 	jt.tree.Refresh()
@@ -406,6 +518,47 @@ func (jt *SearchableJSONTree) fireSearchDebounce() {
 		}
 		jt.applyTreeFilter(q)
 	})
+}
+
+func (jt *SearchableJSONTree) navigateMatch(step int) {
+	if len(jt.matchIDs) == 0 {
+		return
+	}
+	jt.matchIndex += step
+	if jt.matchIndex < 0 {
+		jt.matchIndex = len(jt.matchIDs) - 1
+	} else if jt.matchIndex >= len(jt.matchIDs) {
+		jt.matchIndex = 0
+	}
+	id := jt.matchIDs[jt.matchIndex]
+	jt.openPath(id)
+	jt.tree.Select(id)
+	jt.tree.ScrollTo(id)
+}
+
+func (jt *SearchableJSONTree) openPath(id string) {
+	cur := id
+	for cur != "" {
+		jt.tree.OpenBranch(cur)
+		n := jt.treeNodes[cur]
+		if n == nil {
+			break
+		}
+		cur = n.parent
+	}
+}
+
+func (jt *SearchableJSONTree) updateNavButtons() {
+	if jt.searchUp == nil || jt.searchDown == nil {
+		return
+	}
+	if len(jt.matchIDs) == 0 {
+		jt.searchUp.Disable()
+		jt.searchDown.Disable()
+		return
+	}
+	jt.searchUp.Enable()
+	jt.searchDown.Enable()
 }
 
 func tokenizeQuery(s string) []string {

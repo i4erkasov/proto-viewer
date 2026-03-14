@@ -1,6 +1,6 @@
 //go:build darwin || linux || windows
 
-package application
+package ui
 
 import (
 	"fyne.io/fyne/v2"

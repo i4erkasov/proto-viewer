@@ -10,8 +10,8 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/i4erkasov/proto-viewer/internal/application/widgets/dropzone"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/repository"
+	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/dropzone"
 )
 
 type FileTab struct {
@@ -27,8 +27,8 @@ type FileTab struct {
 	root fyne.CanvasObject
 }
 
-func NewTabFile(w fyne.Window) *FileTab {
-	t := &FileTab{w: w, repo: repository.NewFile()}
+func NewTabFile(w fyne.Window, repo *repository.FileRepo) *FileTab {
+	t := &FileTab{w: w, repo: repo}
 
 	t.pathOrURL = widget.NewEntry()
 	t.pathOrURL.SetPlaceHolder("/path/to/file.bin OR https://host/path/file.bin")
