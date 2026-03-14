@@ -11,6 +11,7 @@ import (
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/secret"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/colorbutton"
+	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -45,7 +46,7 @@ type RedisTab struct {
 	savePass *widget.Check
 
 	dbSelect    *widget.Select
-	keySelect   *widget.Select
+	keySelect   *searchselect.SearchableSelect
 	fieldSelect *widget.Select
 	fieldLabel  *widget.Label
 
@@ -121,8 +122,8 @@ func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
 	t.dbSelect.PlaceHolder = "Select DB…"
 	t.dbSelect.Disable()
 
-	t.keySelect = widget.NewSelect([]string{}, nil)
-	t.keySelect.PlaceHolder = "Select key…"
+	// Key selector with search.
+	t.keySelect = searchselect.NewSearchableSelect(w, "Select key…", []string{})
 	t.keySelect.Disable()
 
 	t.fieldSelect = widget.NewSelect([]string{}, nil)
@@ -257,9 +258,8 @@ func (t *RedisTab) resetAfterConnect() {
 	t.dbSelect.Refresh()
 	t.dbSelect.Disable()
 
-	t.keySelect.Options = nil
+	t.keySelect.SetOptions(nil)
 	t.keySelect.SetSelected("")
-	t.keySelect.Refresh()
 	t.keySelect.Disable()
 
 	t.fieldSelect.Options = nil
@@ -412,9 +412,8 @@ func (t *RedisTab) testAndLoad() {
 }
 
 func (t *RedisTab) onDBSelected(s string) {
-	t.keySelect.Options = nil
+	t.keySelect.SetOptions(nil)
 	t.keySelect.SetSelected("")
-	t.keySelect.Refresh()
 	t.keySelect.Disable()
 
 	t.fieldSelect.Options = nil
@@ -461,9 +460,8 @@ func (t *RedisTab) onDBSelected(s string) {
 		keys, _ := t.repo.Keys(ctx, cfg, dbInt, "*", 2000, 200)
 
 		fyne.Do(func() {
-			t.keySelect.Options = keys
+			t.keySelect.SetOptions(keys)
 			t.keySelect.SetSelected("")
-			t.keySelect.Refresh()
 			if len(keys) > 0 {
 				t.keySelect.Enable()
 			}

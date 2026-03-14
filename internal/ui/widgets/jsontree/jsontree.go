@@ -5,7 +5,9 @@ package jsontree
 import (
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -32,6 +34,7 @@ type SearchableJSONTree struct {
 
 	matchIDs   []string
 	matchIndex int
+	selectedID string
 
 	tree   *widget.Tree
 	scroll *container.Scroll
@@ -65,13 +68,25 @@ func NewSearchableJSONTree() *SearchableJSONTree {
 		jt.childUIDs,
 		jt.isBranch,
 		func(branch bool) fyne.CanvasObject {
-			lbl := canvas.NewText("", theme.ForegroundColor())
-			lbl.TextSize = theme.TextSize() - 1
-			lbl.TextStyle = fyne.TextStyle{Monospace: true}
-			return lbl
+			makeText := func() *canvas.Text {
+				lbl := canvas.NewText("", theme.ForegroundColor())
+				lbl.TextSize = theme.TextSize() - 1
+				lbl.TextStyle = fyne.TextStyle{Monospace: true}
+				return lbl
+			}
+			return container.NewHBox(makeText(), makeText(), makeText())
 		},
 		jt.updateNode,
 	)
+	jt.tree.OnSelected = func(uid string) {
+		jt.selectedID = uid
+	}
+	jt.tree.OnUnselected = func(uid string) {
+		if jt.selectedID == uid {
+			jt.selectedID = ""
+		}
+	}
+
 	jt.tree.Root = jt.rootID
 	jt.tree.HideSeparators = true
 	jt.scroll = container.NewScroll(jt.tree)
@@ -232,41 +247,76 @@ func (jt *SearchableJSONTree) isBranch(uid string) bool {
 }
 
 func (jt *SearchableJSONTree) updateNode(uid string, branch bool, obj fyne.CanvasObject) {
-	lbl := obj.(*canvas.Text)
-	if uid == jt.rootID {
-		lbl.Text = ""
-		lbl.Color = theme.ForegroundColor()
-		lbl.Refresh()
+	row := obj.(*fyne.Container)
+	if len(row.Objects) < 3 {
 		return
 	}
-	if jt.treeNodes == nil {
-		lbl.Text = ""
-		lbl.Color = theme.ForegroundColor()
-		lbl.Refresh()
+	keyText := row.Objects[0].(*canvas.Text)
+	sepText := row.Objects[1].(*canvas.Text)
+	valText := row.Objects[2].(*canvas.Text)
+
+	if uid == jt.rootID || jt.treeNodes == nil {
+		keyText.Text = ""
+		sepText.Text = ""
+		valText.Text = ""
+		sepText.Hide()
+		valText.Hide()
+		keyText.Color = theme.ForegroundColor()
+		sepText.Color = theme.ForegroundColor()
+		valText.Color = theme.ForegroundColor()
+		keyText.Refresh()
+		sepText.Refresh()
+		valText.Refresh()
 		return
 	}
+
 	n, ok := jt.treeNodes[uid]
 	if !ok {
-		lbl.Text = ""
-		lbl.Color = theme.ForegroundColor()
-		lbl.Refresh()
+		keyText.Text = ""
+		sepText.Text = ""
+		valText.Text = ""
+		sepText.Hide()
+		valText.Hide()
+		keyText.Color = theme.ForegroundColor()
+		sepText.Color = theme.ForegroundColor()
+		valText.Color = theme.ForegroundColor()
+		keyText.Refresh()
+		sepText.Refresh()
+		valText.Refresh()
 		return
 	}
+
 	value := n.value
 	if len(n.children) > 0 && jt.tree.IsBranchOpen(uid) && value == "{...}" {
 		value = ""
 	}
+
+	keyText.Text = n.key
 	if value == "" {
-		lbl.Text = n.key
+		sepText.Text = ""
+		valText.Text = ""
+		sepText.Hide()
+		valText.Hide()
 	} else {
-		lbl.Text = n.key + ": " + value
+		sepText.Text = ": "
+		valText.Text = value
+		sepText.Show()
+		valText.Show()
 	}
+
 	if jt.treeMatches != nil && jt.treeMatches[uid] {
-		lbl.Color = theme.PrimaryColor()
+		keyText.Color = theme.PrimaryColor()
+		sepText.Color = theme.PrimaryColor()
+		valText.Color = theme.PrimaryColor()
 	} else {
-		lbl.Color = theme.ForegroundColor()
+		keyText.Color = jsonKeyColor()
+		sepText.Color = jsonPunctColor()
+		valText.Color = jsonValueColor(value)
 	}
-	lbl.Refresh()
+
+	keyText.Refresh()
+	sepText.Refresh()
+	valText.Refresh()
 }
 
 func (jt *SearchableJSONTree) buildTree(id, key, parent string, v any) {
@@ -559,6 +609,149 @@ func (jt *SearchableJSONTree) updateNavButtons() {
 	}
 	jt.searchUp.Enable()
 	jt.searchDown.Enable()
+}
+
+// SelectedValueString returns a JSON string for the selected node value.
+func (jt *SearchableJSONTree) SelectedValueString() string {
+	id := jt.selectedID
+	if id == "" || jt.treeNodes == nil {
+		return ""
+	}
+	n := jt.treeNodes[id]
+	if n == nil {
+		return ""
+	}
+	if len(n.children) == 0 {
+		if n.value == "" {
+			return ""
+		}
+		return n.value
+	}
+	val := jt.nodeToValue(id)
+	b, err := json.MarshalIndent(val, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+func (jt *SearchableJSONTree) nodeToValue(id string) any {
+	n := jt.treeNodes[id]
+	if n == nil {
+		return nil
+	}
+	if len(n.children) == 0 {
+		switch n.value {
+		case "{}":
+			return map[string]any{}
+		case "null":
+			return nil
+		}
+		if strings.HasPrefix(n.value, "[") && strings.HasSuffix(n.value, "]") {
+			return []any{}
+		}
+		var v any
+		if err := json.Unmarshal([]byte(n.value), &v); err == nil {
+			return v
+		}
+		return n.value
+	}
+
+	isArray := true
+	maxIdx := -1
+	idxMap := make(map[int]any, len(n.children))
+	for _, cid := range n.children {
+		cn := jt.treeNodes[cid]
+		if cn == nil {
+			continue
+		}
+		idx, ok := parseArrayIndex(cn.key)
+		if !ok {
+			isArray = false
+			break
+		}
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+		idxMap[idx] = jt.nodeToValue(cid)
+	}
+	if isArray {
+		if maxIdx < 0 {
+			return []any{}
+		}
+		arr := make([]any, maxIdx+1)
+		for i := 0; i <= maxIdx; i++ {
+			arr[i] = idxMap[i]
+		}
+		return arr
+	}
+
+	obj := make(map[string]any, len(n.children))
+	for _, cid := range n.children {
+		cn := jt.treeNodes[cid]
+		if cn == nil {
+			continue
+		}
+		obj[cn.key] = jt.nodeToValue(cid)
+	}
+	return obj
+}
+
+func parseArrayIndex(key string) (int, bool) {
+	if len(key) < 3 || key[0] != '[' || key[len(key)-1] != ']' {
+		return 0, false
+	}
+	i, err := strconv.Atoi(key[1 : len(key)-1])
+	if err != nil || i < 0 {
+		return 0, false
+	}
+	return i, true
+}
+
+func jsonKeyColor() color.Color {
+	return color.NRGBA{R: 0x8B, G: 0xC4, B: 0xF9, A: 0xFF}
+}
+
+func jsonStringColor() color.Color {
+	return color.NRGBA{R: 0x9E, G: 0xD9, B: 0x8A, A: 0xFF}
+}
+
+func jsonNumberColor() color.Color {
+	return color.NRGBA{R: 0xF2, G: 0x9D, B: 0x50, A: 0xFF}
+}
+
+func jsonBoolColor() color.Color {
+	return color.NRGBA{R: 0xB3, G: 0x8D, B: 0xF7, A: 0xFF}
+}
+
+func jsonNullColor() color.Color {
+	return color.NRGBA{R: 0xA0, G: 0xA0, B: 0xA0, A: 0xFF}
+}
+
+func jsonPunctColor() color.Color {
+	return color.NRGBA{R: 0xB0, G: 0xB0, B: 0xB0, A: 0xFF}
+}
+
+func jsonValueColor(v string) color.Color {
+	if v == "" {
+		return theme.ForegroundColor()
+	}
+	switch v {
+	case "null":
+		return jsonNullColor()
+	case "true", "false":
+		return jsonBoolColor()
+	}
+	if strings.HasPrefix(v, "\"") && strings.HasSuffix(v, "\"") {
+		return jsonStringColor()
+	}
+	if strings.HasPrefix(v, "{") || strings.HasPrefix(v, "[") {
+		return jsonPunctColor()
+	}
+	if _, err := strconv.ParseFloat(v, 64); err == nil {
+		return jsonNumberColor()
+	}
+	return theme.ForegroundColor()
 }
 
 func tokenizeQuery(s string) []string {

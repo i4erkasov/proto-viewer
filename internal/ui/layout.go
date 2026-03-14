@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,6 +32,8 @@ import (
 )
 
 const prefLastProtoRoot = "lastProtoRoot"
+const prefPresetIndex = "preset.index"
+const prefPresetPrefix = "preset."
 
 func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	dec := deps.Decoder
@@ -115,13 +118,13 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	var savedSize fyne.Size // размер окна до expand
 
 	outputTabs := container.NewAppTabs(
+		container.NewTabItem("Tree", container.NewBorder(container.NewHBox(layout.NewSpacer(), searchWrap), nil, nil, nil, outTree)),
 		container.NewTabItem("JSON", outMarkdown),
-		container.NewTabItem("Tree", outTree),
 	)
 	outputTabs.SetTabLocation(container.TabLocationTop)
 
 	isTreeTab := func() bool {
-		return outputTabs.SelectedIndex() == 1
+		return outputTabs.SelectedIndex() == 0
 	}
 
 	setSearchVisible := func(show bool) {
@@ -138,6 +141,16 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	}
 
 	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
+	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
+		if !isTreeTab() {
+			return
+		}
+		v := jsonTree.SelectedValueString()
+		if strings.TrimSpace(v) == "" {
+			return
+		}
+		w.Clipboard().SetContent(v)
+	})
 	setSearchVisible(false)
 
 	// Remember the initial window width so auto-resize never inflates it.
@@ -292,136 +305,126 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	}
 
 	// --- buttons
-	btnAutoDetect := widget.NewButton("Auto-detect type", func() {
-		noteTypeError("")
+	// Presets: save/load proto settings.
+	type presetEntry struct {
+		ProtoRoot   string `json:"proto_root"`
+		ProtoFile   string `json:"proto_file"`
+		MessageType string `json:"message_type"`
+	}
 
+	loadPresetIndex := func() []string {
+		raw := strings.TrimSpace(prefs.String(prefPresetIndex))
+		if raw == "" {
+			return nil
+		}
+		var list []string
+		if err := json.Unmarshal([]byte(raw), &list); err != nil {
+			return nil
+		}
+		return list
+	}
+
+	savePresetIndex := func(list []string) {
+		b, err := json.Marshal(list)
+		if err != nil {
+			return
+		}
+		prefs.SetString(prefPresetIndex, string(b))
+	}
+
+	savePreset := func(name string, p presetEntry) {
+		b, err := json.Marshal(p)
+		if err != nil {
+			return
+		}
+		prefs.SetString(prefPresetPrefix+name, string(b))
+		list := loadPresetIndex()
+		seen := make(map[string]struct{}, len(list))
+		for _, v := range list {
+			seen[v] = struct{}{}
+		}
+		if _, ok := seen[name]; !ok {
+			list = append(list, name)
+			sort.Strings(list)
+			savePresetIndex(list)
+		}
+	}
+
+	loadPreset := func(name string) (presetEntry, bool) {
+		raw := strings.TrimSpace(prefs.String(prefPresetPrefix + name))
+		if raw == "" {
+			return presetEntry{}, false
+		}
+		var p presetEntry
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			return presetEntry{}, false
+		}
+		return p, true
+	}
+
+	btnSavePreset := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
 		root := strings.TrimSpace(protoRoot.Text)
-		protoAbs := strings.TrimSpace(protoFile.Text)
-		if root == "" {
-			noteTypeError("Proto root is not set")
+		pfile := strings.TrimSpace(protoFile.Text)
+		mtype := strings.TrimSpace(typeSelect.Selected())
+		if mtype == "" {
+			dialog.ShowError(fmt.Errorf("message type is required to save"), w)
 			return
 		}
-		if protoAbs == "" {
-			noteTypeError("Proto file is not selected")
-			return
-		}
-		if len(typeSelect.Options()) == 0 {
-			noteTypeError("No message types found in the selected .proto")
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-
-		// Fetch bytes from active source, supporting multi-payload sources.
-		var src interface {
-			Fetch(context.Context) ([]byte, error)
-		}
-		var srcMany interface {
-			FetchMany(context.Context) ([][]byte, error)
-		}
-
-		switch sourceTabs.SelectedIndex() {
-		case 0:
-			src = fileTab
-		case 1:
-			src = redisTab
-		default:
-			noteTypeError("Unknown source tab")
-			return
-		}
-		// Effective gzip can be overridden by the active tab (Redis).
-		effectiveGzip := gzipCheck.Checked
-		if sourceTabs.SelectedIndex() == 1 {
-			if gz, ok := any(redisTab).(interface{ Gzip() bool }); ok {
-				effectiveGzip = gz.Gzip()
-			}
-		}
-
-		payloads := make([][]byte, 0, 1)
-		if srcMany != nil {
-			arr, err := srcMany.FetchMany(ctx)
-			if err != nil {
-				noteTypeError("Failed to read input bytes: " + err.Error())
-				return
-			}
-			payloads = arr
-		} else {
-			payload, err := src.Fetch(ctx)
-			if err != nil {
-				noteTypeError("Failed to read input bytes: " + err.Error())
-				return
-			}
-			payloads = append(payloads, payload)
-		}
-		if len(payloads) == 0 {
-			noteTypeError("No data")
-			return
-		}
-
-		// Try each type and collect all successful decodes (all payloads must decode).
-		matches := make([]string, 0, 8)
-		for _, fullType := range typeSelect.Options() {
-			allOK := true
-			for _, p := range payloads {
-				tryCtx, tryCancel := context.WithTimeout(ctx, 900*time.Millisecond)
-				_, derr := dec.Decode(tryCtx, domain.DecodeRequest{
-					ProtoRoot: root,
-					ProtoFile: protoAbs,
-					FullType:  fullType,
-					Gzip:      effectiveGzip,
-					Format:    domain.OutputFormatJSON,
-					Bytes:     p,
-				})
-				tryCancel()
-				if derr != nil {
-					allOK = false
-					break
+		nameEntry := widget.NewEntry()
+		nameEntry.SetPlaceHolder("Preset name (default: message type)")
+		form := dialog.NewForm("Save preset", "Save", "Cancel",
+			[]*widget.FormItem{{Text: "Name", Widget: nameEntry}},
+			func(ok bool) {
+				if !ok {
+					return
 				}
-			}
-			if allOK {
-				matches = append(matches, fullType)
-			}
-		}
+				name := strings.TrimSpace(nameEntry.Text)
+				if name == "" {
+					name = mtype
+				}
+				savePreset(name, presetEntry{ProtoRoot: root, ProtoFile: pfile, MessageType: mtype})
+			},
+			w,
+		)
+		form.Resize(fyne.NewSize(520, 160))
+		form.Show()
+	})
 
-		if len(matches) == 0 {
-			noteTypeError("Couldn't auto-detect message type (no type could decode the payload)")
+	btnLoadPreset := widget.NewButtonWithIcon("Load", theme.DownloadIcon(), func() {
+		list := loadPresetIndex()
+		if len(list) == 0 {
+			dialog.ShowInformation("Load preset", "No saved presets", w)
 			return
 		}
-
-		// If there is exactly one match, apply it directly.
-		if len(matches) == 1 {
-			typeSelect.SetSelected(matches[0])
-			return
-		}
-
-		// Show modal with all candidates so user can choose the correct one.
-		// Use a Select widget for a simple list experience.
-		sel := widget.NewSelect(matches, func(string) {})
-		sel.PlaceHolder = "Choose a detected type…"
-
+		sel := searchselect.NewSearchableSelect(w, "Search preset…", list)
 		dlg := dialog.NewCustomConfirm(
-			"Auto-detect: choose type",
-			"Use",
+			"Load preset",
+			"Load",
 			"Cancel",
 			container.NewVBox(
-				widget.NewLabel(fmt.Sprintf("Found %d matching message types:", len(matches))),
+				widget.NewLabel("Select a saved preset:"),
 				sel,
 			),
 			func(ok bool) {
 				if !ok {
 					return
 				}
-				s := strings.TrimSpace(sel.Selected)
-				if s == "" {
-					noteTypeError("Please select one of the detected message types")
+				name := strings.TrimSpace(sel.Selected())
+				if name == "" {
 					return
 				}
-				typeSelect.SetSelected(s)
+				p, ok := loadPreset(name)
+				if !ok {
+					dialog.ShowError(fmt.Errorf("failed to load preset"), w)
+					return
+				}
+				protoRoot.SetText(p.ProtoRoot)
+				protoFile.SetText(p.ProtoFile)
+				typeSelect.SetSelected(p.MessageType)
 			},
 			w,
 		)
-		dlg.Resize(fyne.NewSize(520, 220))
+		dlg.Resize(fyne.NewSize(520, 240))
 		dlg.Show()
 	})
 
@@ -554,7 +557,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	// Message type row: label + select + button all in one line.
 	msgTypeRow := container.NewBorder(nil, nil,
 		widget.NewLabel("Message type:"),
-		btnAutoDetect,
+		container.NewHBox(btnSavePreset, btnLoadPreset),
 		typeSelect,
 	)
 
@@ -584,13 +587,9 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		container.NewBorder(nil, nil, nil, overlayButtons, layout.NewSpacer()),
 		layout.NewSpacer(),
 	)
-	searchOverlay := container.NewVBox(
-		container.NewHBox(layout.NewSpacer(), container.NewPadded(searchWrap)),
-		layout.NewSpacer(),
-	)
-	outputStack := container.NewStack(outputTabs, btnOverlay, searchOverlay)
+	outputStack := container.NewStack(outputTabs, btnOverlay)
 
-	// Header removed: search is now overlaid on output.
+	// Header removed: search is now above output.
 
 	// Decode button (wiring TODO - placeholder to keep layout stable)
 	btnDecode := widget.NewButtonWithIcon("Decode", theme.ViewRefreshIcon(), nil)
