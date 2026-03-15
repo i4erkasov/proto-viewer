@@ -76,10 +76,11 @@ type SearchableSelect struct {
 	highlight int // index in filtered, -1 means none
 	disabled  bool
 
-	fieldClick  *widget.Button
+	fieldClick  *tapArea
 	label       *widget.Label
 	arrowButton *widget.Button
 	btnWrap     *fyne.Container
+	labelWrap   *fyne.Container
 
 	popupBase *widget.PopUp
 	search    *focusLostEntry
@@ -95,19 +96,20 @@ type SearchableSelect struct {
 	bg        *canvas.Rectangle
 	border    *canvas.Rectangle
 	arrowWrap *fyne.Container
+
+	textStyle fyne.TextStyle
+	minWidth  float32
 }
 
 func NewSearchableSelect(win fyne.Window, placeholder string, options []string) *SearchableSelect {
 	ss := &SearchableSelect{win: win, highlight: -1, placeholder: placeholder}
+	ss.minWidth = 220
 
 	ss.label = widget.NewLabel("")
 	ss.label.Alignment = fyne.TextAlignLeading
 	ss.label.Truncation = fyne.TextTruncateEllipsis
 
-	ss.fieldClick = widget.NewButton("", func() { ss.Toggle() })
-	ss.fieldClick.Alignment = widget.ButtonAlignLeading
-	ss.fieldClick.Importance = widget.LowImportance
-	ss.fieldClick.SetText(ss.label.Text)
+	ss.fieldClick = newTapArea(func() { ss.Toggle() })
 
 	ss.arrowButton = widget.NewButtonWithIcon("", theme.MenuDropDownIcon(), func() { ss.Toggle() })
 	ss.arrowButton.Importance = widget.LowImportance
@@ -125,7 +127,8 @@ func NewSearchableSelect(win fyne.Window, placeholder string, options []string) 
 	}
 	ss.arrowWrap = container.NewGridWrap(arrowSize, ss.arrowButton)
 
-	ss.btnWrap = container.NewBorder(nil, nil, nil, ss.arrowWrap, ss.fieldClick)
+	ss.labelWrap = container.NewStack(ss.label, ss.fieldClick)
+	ss.btnWrap = container.NewBorder(nil, nil, nil, ss.arrowWrap, ss.labelWrap)
 
 	// Rounded border frame (native-like)
 	ss.bg = canvas.NewRectangle(theme.InputBackgroundColor())
@@ -164,32 +167,37 @@ func NewSearchableSelect(win fyne.Window, placeholder string, options []string) 
 			return len(ss.filtered)
 		},
 		func() fyne.CanvasObject {
-			b := widget.NewButton("", nil)
-			b.Alignment = widget.ButtonAlignLeading
-			b.Importance = widget.LowImportance
-			return b
+			lbl := widget.NewLabel("")
+			lbl.Alignment = fyne.TextAlignLeading
+			btn := newTapArea(nil)
+			row := container.NewStack(lbl, btn)
+			return row
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			b := o.(*widget.Button)
+			row := o.(*fyne.Container)
+			lbl := row.Objects[0].(*widget.Label)
+			btn := row.Objects[1].(*tapArea)
+			lbl.TextStyle = ss.textStyle
+			lbl.Refresh()
 			if len(ss.filtered) == 0 {
-				b.SetText("Nothing found")
-				b.Disable()
-				b.OnTapped = nil
+				lbl.SetText("Nothing found")
+				btn.Disable()
+				btn.onTapped = nil
 				return
 			}
 
-			b.Enable()
+			btn.Enable()
 			if int(i) >= 0 && int(i) < len(ss.filtered) {
 				val := ss.filtered[i]
-				b.SetText(val)
-				b.OnTapped = func() {
+				lbl.SetText(val)
+				btn.onTapped = func() {
 					ss.highlight = int(i)
 					ss.list.Select(i)
 					ss.pickByFilteredIndex(int(i))
 				}
 			} else {
-				b.SetText("")
-				b.OnTapped = nil
+				lbl.SetText("")
+				btn.onTapped = nil
 			}
 		},
 	)
@@ -217,6 +225,7 @@ func NewSearchableSelect(win fyne.Window, placeholder string, options []string) 
 	ss.ExtendBaseWidget(ss)
 	ss.SetOptions(options)
 	ss.updateButtonLabel()
+	ss.applyTextStyle()
 	return ss
 }
 
@@ -246,26 +255,22 @@ func (r *searchableSelectRenderer) MinSize() fyne.Size {
 	// Make MinSize stable so parent containers (and potentially window) don't reflow on state changes.
 	// Height: like Entry.
 	eh := widget.NewEntry().MinSize().Height
-	btnH := r.ss.fieldClick.MinSize().Height
+	btnH := r.ss.label.MinSize().Height
 	minH := eh
 	if btnH > minH {
 		minH = btnH
 	}
 
 	// Width: label/button + arrow + padding.
-	// Use current widget size if it's already laid out (prevents initial jitter).
-	if sz := r.ss.Size(); sz.Width > 0 {
-		return fyne.NewSize(sz.Width, minH)
-	}
 
 	arrowW := float32(0)
 	if r.ss.arrowWrap != nil {
 		arrowW = r.ss.arrowWrap.MinSize().Width
 	}
-	btnW := r.ss.fieldClick.MinSize().Width
+	btnW := r.ss.labelWrap.MinSize().Width
 	minW := btnW + arrowW
-	if minW < 220 {
-		minW = 220
+	if minW < r.ss.minWidth {
+		minW = r.ss.minWidth
 	}
 	return fyne.NewSize(minW, minH)
 }
@@ -335,7 +340,9 @@ func (ss *SearchableSelect) syncOpenState() {
 
 func (ss *SearchableSelect) Enable() {
 	ss.disabled = false
-	ss.fieldClick.Enable()
+	if ss.fieldClick != nil {
+		ss.fieldClick.Enable()
+	}
 	ss.arrowButton.Enable()
 	ss.Refresh()
 }
@@ -343,7 +350,9 @@ func (ss *SearchableSelect) Enable() {
 func (ss *SearchableSelect) Disable() {
 	ss.disabled = true
 	ss.HidePopup()
-	ss.fieldClick.Disable()
+	if ss.fieldClick != nil {
+		ss.fieldClick.Disable()
+	}
 	ss.arrowButton.Disable()
 	ss.Refresh()
 }
@@ -423,6 +432,29 @@ func (ss *SearchableSelect) SetOptions(opts []string) {
 	ss.updateButtonLabel()
 }
 
+func (ss *SearchableSelect) SetTextStyle(style fyne.TextStyle) {
+	ss.textStyle = style
+	ss.applyTextStyle()
+}
+
+func (ss *SearchableSelect) SetMinWidth(w float32) {
+	if w <= 0 {
+		return
+	}
+	ss.minWidth = w
+	ss.Refresh()
+}
+
+func (ss *SearchableSelect) applyTextStyle() {
+	if ss.label != nil {
+		ss.label.TextStyle = ss.textStyle
+		ss.label.Refresh()
+	}
+	if ss.list != nil {
+		ss.list.Refresh()
+	}
+}
+
 func (ss *SearchableSelect) updateButtonLabel() {
 	if ss.selected == "" {
 		ph := strings.TrimSpace(ss.placeholder)
@@ -430,11 +462,11 @@ func (ss *SearchableSelect) updateButtonLabel() {
 			ph = "Select..."
 		}
 		ss.label.SetText(ph)
-		ss.fieldClick.SetText(ss.label.Text)
+		ss.applyTextStyle()
 		return
 	}
 	ss.label.SetText(ss.selected)
-	ss.fieldClick.SetText(ss.label.Text)
+	ss.applyTextStyle()
 }
 
 func (ss *SearchableSelect) applyFilter(q string) {
@@ -541,7 +573,7 @@ func (ss *SearchableSelect) ensurePopupSizedAndPositioned() {
 		w = ss.btnWrap.Size().Width
 	}
 	if w <= 0 {
-		w = ss.fieldClick.Size().Width
+		w = ss.labelWrap.Size().Width
 	}
 	if w < 140 {
 		w = 140
@@ -663,3 +695,39 @@ func (ss *SearchableSelect) Clear() {
 
 // colorTransparent returns a fully transparent color.
 // (unused)
+
+type tapArea struct {
+	widget.BaseWidget
+	onTapped func()
+	disabled bool
+}
+
+func newTapArea(onTapped func()) *tapArea {
+	t := &tapArea{onTapped: onTapped}
+	t.ExtendBaseWidget(t)
+	return t
+}
+
+func (t *tapArea) Tapped(_ *fyne.PointEvent) {
+	if t.disabled {
+		return
+	}
+	if t.onTapped != nil {
+		t.onTapped()
+	}
+}
+
+func (t *tapArea) Enable() {
+	t.disabled = false
+	t.Refresh()
+}
+
+func (t *tapArea) Disable() {
+	t.disabled = true
+	t.Refresh()
+}
+
+func (t *tapArea) CreateRenderer() fyne.WidgetRenderer {
+	rect := canvas.NewRectangle(color.Transparent)
+	return widget.NewSimpleRenderer(rect)
+}

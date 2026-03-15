@@ -103,17 +103,19 @@ func NewSearchableJSONTree() *SearchableJSONTree {
 		}
 	})
 
-	jt.searchUp = widget.NewButton("▲", func() {
+	jt.searchUp = widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
 		jt.navigateMatch(-1)
 	})
-	jt.searchDown = widget.NewButton("▼", func() {
+	jt.searchDown = widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
 		jt.navigateMatch(1)
 	})
+	jt.searchUp.Importance = widget.LowImportance
+	jt.searchDown.Importance = widget.LowImportance
 	jt.searchUp.Disable()
 	jt.searchDown.Disable()
 
 	jt.searchWrap = container.NewGridWrap(
-		fyne.NewSize(420, jt.searchEntry.MinSize().Height),
+		fyne.NewSize(480, jt.searchEntry.MinSize().Height),
 		container.NewHBox(jt.searchEntry, jt.searchUp, jt.searchDown),
 	)
 	jt.searchWidth = 420

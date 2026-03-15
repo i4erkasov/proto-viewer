@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"image/color"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
@@ -52,12 +54,30 @@ func (overlayLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
 	}
 	overlay := objects[1]
 	pad := theme.Padding()
-	os := overlay.MinSize()
+	os := overlay.Size()
+	if os.Width <= 0 || os.Height <= 0 {
+		os = overlay.MinSize()
+	}
+	min := overlay.MinSize()
+	if os.Width < min.Width {
+		os.Width = min.Width
+	}
+	if os.Height < min.Height {
+		os.Height = min.Height
+	}
+	maxW := size.Width - pad*2
+	if maxW < 0 {
+		maxW = 0
+	}
+	if os.Width > maxW {
+		os.Width = maxW
+	}
+	// Keep overlay on the right but below the expand/collapse button.
 	x := size.Width - os.Width - pad
 	if x < 0 {
 		x = 0
 	}
-	y := pad
+	y := pad + theme.IconInlineSize() + pad
 	overlay.Move(fyne.NewPos(x, y))
 	overlay.Resize(os)
 }
@@ -66,21 +86,7 @@ func (overlayLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
 	if len(objects) == 0 {
 		return fyne.NewSize(0, 0)
 	}
-	base := objects[0].MinSize()
-	if len(objects) < 2 {
-		return base
-	}
-	overlay := objects[1].MinSize()
-	pad := theme.Padding() * 2
-	w := base.Width
-	if overlay.Width+pad > w {
-		w = overlay.Width + pad
-	}
-	h := base.Height
-	if overlay.Height+pad > h {
-		h = overlay.Height + pad
-	}
-	return fyne.NewSize(w, h)
+	return objects[0].MinSize()
 }
 
 func build(w fyne.Window, deps Deps) fyne.CanvasObject {
@@ -166,25 +172,29 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 
 	// Output widget (JSON tree + markdown)
 	jsonTree := jsontree.NewSearchableJSONTree()
-	jsonMarkdown := jsonmarkdown.NewJSONMarkdownView()
+	jsonMarkdown := jsonmarkdown.NewJSONMarkdownView(w)
 
 	_ = jsonTree.View()
 	outMarkdown := jsonMarkdown.View()
 	_ = jsonTree.SearchBar()
 	searchJSONWrap := jsonMarkdown.SearchBar()
 
+	// Рамка вокруг области вывода JSON.
+	outputBorder := canvas.NewRectangle(color.Transparent)
+	outputBorder.StrokeColor = theme.InputBorderColor()
+	outputBorder.StrokeWidth = theme.InputBorderSize()
+	outputBorder.CornerRadius = theme.InputRadiusSize()
+	outputBody := container.NewMax(container.NewStack(outputBorder, outMarkdown))
+
 	// Let header decide width; keep same behavior as before.
 	jsonTree.SetSearchWidth(420)
-	jsonMarkdown.SetSearchWidth(420)
+	jsonMarkdown.SetSearchWidth(500)
 
 	var resultPanel *fyne.Container
 	var isOutputExpanded bool
 	var savedSize fyne.Size // размер окна до expand
 
-	outputTabs := container.NewAppTabs(
-		container.NewTabItem("JSON", container.New(overlayLayout{}, outMarkdown, searchJSONWrap)),
-	)
-	outputTabs.SetTabLocation(container.TabLocationTop)
+	outputContent := container.NewMax(container.New(overlayLayout{}, outputBody, searchJSONWrap))
 
 	isTreeTab := func() bool {
 		return false
@@ -360,13 +370,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			resetProtoSelection()
 		}
 	}
-
-	// --- GZIP
-	gzipCheck := widget.NewCheck("GZIP compressed", nil)
-	gzipCheck.SetChecked(false)
-	gzipHint := widget.NewLabel("")
-	gzipHint.TextStyle = fyne.TextStyle{Italic: true}
-	gzipHint.Hide()
 
 	// ---- Source tabs (File/Redis/SQL)
 	fileTab := tab.NewTabFile(w, deps.FileRepo)
@@ -560,19 +563,14 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		loadPresetDialog.Show()
 	})
 
-	lblProtoRoot := widget.NewLabel("Proto root:")
-	lblProtoFile := widget.NewLabel("Proto file:")
-	lblW := lblProtoRoot.MinSize().Width
-	for _, l := range []*widget.Label{lblProtoFile} {
-		if l.MinSize().Width > lblW {
-			lblW = l.MinSize().Width
-		}
-	}
-	lblH := lblProtoRoot.MinSize().Height
-	lblProtoRootWrap := container.NewGridWrap(fyne.NewSize(lblW, lblH), lblProtoRoot)
-	lblProtoFileWrap := container.NewGridWrap(fyne.NewSize(lblW, lblH), lblProtoFile)
+	// --- GZIP
+	gzipCheck := widget.NewCheck("GZIP compressed", nil)
+	gzipCheck.SetChecked(false)
+	gzipHint := widget.NewLabel("")
+	gzipHint.TextStyle = fyne.TextStyle{Italic: true}
+	gzipHint.Hide()
 
-	// Browse buttons
+	// --- Browse buttons
 	btnBrowseRoot := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
 		d := dialog.NewFolderOpen(func(u fyne.ListableURI, err error) {
 			if err != nil {
@@ -586,7 +584,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			prefs.SetString(prefLastProtoRoot, u.Path())
 		}, w)
 
-		// try open at last root
 		if last := strings.TrimSpace(protoRoot.Text); last != "" {
 			if uri, err := storage.ParseURI("file://" + last); err == nil {
 				if lu, ok := uri.(fyne.ListableURI); ok {
@@ -594,22 +591,18 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				}
 			}
 		}
-
 		d.Show()
 	})
+
 	btnBrowseProto := widget.NewButtonWithIcon("", theme.ListIcon(), func() {
 		root := strings.TrimSpace(protoRoot.Text)
 		if root == "" {
 			dialog.ShowError(fmt.Errorf("set Proto root first"), w)
 			return
 		}
-
 		p, err := protopicker.New(w, root, func(absP string) {
 			protoFile.SetText(absP)
-
-			// Parse types in background (big proto files can be slow).
 			lblStatus.SetText("Status: parsing proto…")
-
 			go func(path string) {
 				fi, err := os.Stat(path)
 				if err != nil {
@@ -620,7 +613,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 					return
 				}
 
-				// cache lookup
 				protoTypeCache.mu.Lock()
 				ce, ok := protoTypeCache.items[path]
 				protoTypeCache.mu.Unlock()
@@ -671,7 +663,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		p.Show()
 	})
 
-	// Wrap icon buttons into a fixed size so they don't stretch/shrink oddly in Border layout.
 	btnW := btnBrowseRoot.MinSize().Width
 	btnH := btnBrowseRoot.MinSize().Height
 	if ms := btnBrowseProto.MinSize(); ms.Width > btnW {
@@ -683,10 +674,19 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	btnBrowseRootWrap := container.NewGridWrap(fyne.NewSize(btnW, btnH), btnBrowseRoot)
 	btnBrowseProtoWrap := container.NewGridWrap(fyne.NewSize(btnW, btnH), btnBrowseProto)
 
+	lblProtoRoot := widget.NewLabel("Proto root:")
+	lblProtoFile := widget.NewLabel("Proto file:")
+	lblW := lblProtoRoot.MinSize().Width
+	if lblProtoFile.MinSize().Width > lblW {
+		lblW = lblProtoFile.MinSize().Width
+	}
+	lblH := lblProtoRoot.MinSize().Height
+	lblProtoRootWrap := container.NewGridWrap(fyne.NewSize(lblW, lblH), lblProtoRoot)
+	lblProtoFileWrap := container.NewGridWrap(fyne.NewSize(lblW, lblH), lblProtoFile)
+
 	protoRootRow := container.NewBorder(nil, nil, lblProtoRootWrap, btnBrowseRootWrap, protoRoot)
 	protoFileRow := container.NewBorder(nil, nil, lblProtoFileWrap, btnBrowseProtoWrap, protoFile)
 
-	// Message type row: label + select + button all in one line.
 	msgTypeRow := container.NewBorder(nil, nil,
 		widget.NewLabel("Message type:"),
 		container.NewHBox(btnSavePreset, btnLoadPreset),
@@ -701,10 +701,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		widget.NewSeparator(),
 	)
 
-	// ---- Result area
-	// remove unused local status label (we use lblStatus already)
-
-	// Expand/collapse output
+	// Output area: expand/collapse buttons (show/hide output)
 	btnToggleOutput := widget.NewButtonWithIcon("", theme.ViewFullScreenIcon(), nil)
 	btnToggleOutput.Importance = widget.LowImportance
 
@@ -718,7 +715,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		container.NewBorder(nil, nil, nil, overlayButtons, layout.NewSpacer()),
 		layout.NewSpacer(),
 	)
-	outputStack := container.NewStack(outputTabs, btnOverlay)
+	outputStack := container.NewStack(outputContent, btnOverlay)
 
 	// Header removed: search is now above output.
 
@@ -1057,21 +1054,13 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	})
 	btnOpenCache.Importance = widget.LowImportance
 
+	btnCopy.Importance = widget.LowImportance
 	actions := container.NewHBox(lblStatus, layout.NewSpacer(), container.NewHBox(btnDecode, btnCopy, btnOpenCache))
 
 	resultPanel = container.NewBorder(nil, actions, nil, nil, outputStack)
 
 	// Output should take all available space.
 	// (searchRow remains above output)
-
-	outputTabs.OnSelected = func(_ *container.TabItem) {
-		if !isTreeTab() {
-			setSearchVisible(false)
-		}
-		if !isJSONTab() {
-			setJSONSearchVisible(false)
-		}
-	}
 
 	// Layout: keep outputStack in a single container to avoid reparenting issues.
 	contentArea := container.NewBorder(sourceTabs, nil, nil, nil, resultPanel)

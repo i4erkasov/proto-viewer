@@ -18,8 +18,10 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 )
 
 const (
@@ -45,17 +47,21 @@ type JSONMarkdownView struct {
 	overlay *tapOverlay
 	scroll  *container.Scroll
 
-	searchEntry *escEntry
-	searchUp    *widget.Button
-	searchDown  *widget.Button
-	searchWrap  *fyne.Container
-	searchWidth float32
-	searchQuery string
-	matchLines  []int
-	matchIndex  int
-	highlights  map[int][]highlightRange
+	searchEntry     *escEntry
+	searchUp        *widget.Button
+	searchDown      *widget.Button
+	searchUpWrap    *fyne.Container
+	searchDownWrap  *fyne.Container
+	searchNavWrap   *fyne.Container
+	searchEntryWrap *fyne.Container
+	searchWrap      *fyne.Container
+	searchWidth     float32
+	searchQuery     string
+	matchLines      []int
+	matchIndex      int
+	highlights      map[int][]highlightRange
 
-	searchKeySelect *widget.Select
+	searchKeySelect *searchselect.SearchableSelect
 	searchKeyWidth  float32
 	searchKey       string
 	searchKeys      []string
@@ -84,12 +90,15 @@ type keyRange struct {
 }
 
 // NewJSONMarkdownView creates a markdown view with lazy loading.
-func NewJSONMarkdownView() *JSONMarkdownView {
+func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 	v := &JSONMarkdownView{chunk: defaultChunkLines}
 	v.tgrid = widget.NewTextGrid()
 	v.overlay = newTapOverlay(v.handleTap)
 	// styles applied per cell
-	v.scroll = container.NewScroll(container.NewMax(v.tgrid, v.overlay))
+	padTop := canvas.NewRectangle(color.Transparent)
+	padTop.SetMinSize(fyne.NewSize(1, theme.Padding()))
+	content := container.NewBorder(padTop, nil, nil, nil, container.NewMax(v.tgrid, v.overlay))
+	v.scroll = container.NewScroll(content)
 	v.scroll.OnScrolled = func(_ fyne.Position) {
 		v.tryLoadMore()
 	}
@@ -106,36 +115,56 @@ func NewJSONMarkdownView() *JSONMarkdownView {
 		}
 	})
 
-	v.searchKeySelect = widget.NewSelect([]string{searchKeyPrompt}, func(s string) {
+	v.searchKeySelect = searchselect.NewSearchableSelect(win, searchKeyPrompt, nil)
+	v.searchKeySelect.SetTextStyle(fyne.TextStyle{})
+	v.searchKeySelect.SetMinWidth(200)
+	v.searchKeySelect.OnChanged = func(s string) {
 		v.mu.Lock()
-		if s == searchKeyPrompt {
-			v.searchKey = ""
-		} else {
-			v.searchKey = s
-		}
+		v.searchKey = strings.TrimSpace(s)
 		key := v.searchKey
 		v.mu.Unlock()
 		v.applyKeyFilter(key)
 		v.applySearchAsync(v.searchEntry.Text)
-	})
-	v.searchKeySelect.SetSelected(searchKeyPrompt)
-	v.searchKeyWidth = 180
+	}
+	v.searchKeySelect.SetSelected("")
+	v.searchKeyWidth = 200
 
-	v.searchUp = widget.NewButton("▲", func() {
+	v.searchUp = widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
 		v.navigateMatch(-1)
 	})
-	v.searchDown = widget.NewButton("▼", func() {
+	v.searchDown = widget.NewButtonWithIcon("", theme.MoveDownIcon(), func() {
 		v.navigateMatch(1)
 	})
+	v.searchUp.Importance = widget.LowImportance
+	v.searchDown.Importance = widget.LowImportance
+	btnH := v.searchEntry.MinSize().Height
+	btnW := btnH
+	if ms := v.searchUp.MinSize(); ms.Width > btnW {
+		btnW = ms.Width
+	}
+	if ms := v.searchDown.MinSize(); ms.Width > btnW {
+		btnW = ms.Width
+	}
+	v.searchUpWrap = container.NewGridWrap(fyne.NewSize(btnW, btnH), v.searchUp)
+	v.searchDownWrap = container.NewGridWrap(fyne.NewSize(btnW, btnH), v.searchDown)
 	v.searchUp.Disable()
 	v.searchDown.Disable()
 
+	navRow := container.NewGridWithColumns(2, v.searchUpWrap, v.searchDownWrap)
+	v.searchNavWrap = container.NewGridWrap(fyne.NewSize(btnW*2, btnH), navRow)
+
+	entryH := v.searchEntry.MinSize().Height
+	entryPad := container.NewGridWrap(fyne.NewSize(btnW*2, entryH), layout.NewSpacer())
+	entryLayer := container.NewBorder(nil, nil, nil, entryPad, v.searchEntry)
+	v.searchEntryWrap = container.NewStack(entryLayer, container.NewBorder(nil, nil, nil, v.searchNavWrap, layout.NewSpacer()))
+
 	v.searchWrap = container.NewGridWrap(
-		fyne.NewSize(420, v.searchEntry.MinSize().Height),
-		container.NewHBox(v.searchKeySelect, v.searchEntry, v.searchUp, v.searchDown),
+		fyne.NewSize(500, v.searchEntry.MinSize().Height),
+		container.NewHBox(layout.NewSpacer(), v.searchKeySelect, v.searchEntryWrap),
 	)
-	v.searchWidth = 420
+	v.searchWidth = 500
 	v.searchWrap.Hide()
+	v.SetSearchWidth(v.searchWidth)
 
 	return v
 }
@@ -161,9 +190,17 @@ func (v *JSONMarkdownView) SetSearchWidth(w float32) {
 		return
 	}
 	v.searchWidth = w
-	btnW := v.searchUp.MinSize().Width + v.searchDown.MinSize().Width + theme.Padding()*2
-	avail := w - btnW
+	btnW := theme.Padding() * 2
+	if v.searchNavWrap != nil {
+		btnW += v.searchNavWrap.MinSize().Width
+	}
+	avail := w
 	keyW := v.searchKeyWidth
+	if v.searchKeySelect != nil {
+		if ms := v.searchKeySelect.MinSize(); ms.Width > 0 {
+			keyW = ms.Width
+		}
+	}
 	entryW := avail - keyW
 	minEntryW := v.searchEntry.MinSize().Width
 	if entryW < minEntryW {
@@ -178,11 +215,18 @@ func (v *JSONMarkdownView) SetSearchWidth(w float32) {
 		fyne.NewSize(keyW, v.searchEntry.MinSize().Height),
 		v.searchKeySelect,
 	)
-	entryWrap := container.NewGridWrap(
-		fyne.NewSize(entryW, v.searchEntry.MinSize().Height),
-		v.searchEntry,
-	)
-	row := container.NewHBox(keyWrap, entryWrap, v.searchUp, v.searchDown)
+
+	entryH := v.searchEntry.MinSize().Height
+	padW := float32(0)
+	if v.searchNavWrap != nil {
+		padW = v.searchNavWrap.MinSize().Width
+	}
+	entryPad := container.NewGridWrap(fyne.NewSize(padW, entryH), layout.NewSpacer())
+	entryLayer := container.NewBorder(nil, nil, nil, entryPad, v.searchEntry)
+	entryStack := container.NewStack(entryLayer, container.NewBorder(nil, nil, nil, v.searchNavWrap, layout.NewSpacer()))
+	entryWrap := container.NewGridWrap(fyne.NewSize(entryW, entryH), entryStack)
+
+	row := container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
 	row.Resize(fyne.NewSize(w, v.searchEntry.MinSize().Height))
 	row.Refresh()
 
@@ -445,15 +489,14 @@ func (v *JSONMarkdownView) setSearchKeys(keys []string) {
 	if keys == nil {
 		keys = nil
 	}
-	opts := make([]string, 0, len(keys)+1)
-	opts = append(opts, searchKeyPrompt)
+	opts := make([]string, 0, len(keys))
 	opts = append(opts, keys...)
 	fyne.Do(func() {
 		if v.searchKeySelect == nil {
 			return
 		}
-		v.searchKeySelect.Options = opts
-		v.searchKeySelect.SetSelected(searchKeyPrompt)
+		v.searchKeySelect.SetOptions(opts)
+		v.searchKeySelect.SetSelected("")
 		v.searchKeySelect.Refresh()
 	})
 }

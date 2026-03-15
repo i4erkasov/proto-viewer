@@ -26,12 +26,12 @@ func main() {
 	w.SetContent(u.Content())
 
 	// Size window to content, but keep it within reasonable bounds.
-	min := u.Content().MinSize()
-	csize := fyne.NewSize(
-		clamp(min.Width+0, 940, 1480),
-		clamp(min.Height+0, 580, 940),
+	minSize := u.Content().MinSize()
+	cSize := fyne.NewSize(
+		clamp(minSize.Width, 1024, 1480),
+		clamp(minSize.Height, 648, 940),
 	)
-	w.Resize(csize)
+	w.Resize(cSize)
 
 	w.ShowAndRun()
 }
