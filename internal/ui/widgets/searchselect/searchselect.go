@@ -1,6 +1,7 @@
 package searchselect
 
 import (
+	"fmt"
 	"image/color"
 	"strings"
 
@@ -90,7 +91,8 @@ type SearchableSelect struct {
 
 	prevOnTypedKey func(*fyne.KeyEvent)
 
-	OnChanged func(string)
+	OnChanged      func(string)
+	OnChangedMulti func([]string)
 
 	frameWrap *fyne.Container
 	bg        *canvas.Rectangle
@@ -99,11 +101,21 @@ type SearchableSelect struct {
 
 	textStyle fyne.TextStyle
 	minWidth  float32
+
+	emptyLabel string
+	allowEmpty bool
+	multi      bool
+
+	selectedSet    map[string]struct{}
+	selectedValues []string
 }
 
 func NewSearchableSelect(win fyne.Window, placeholder string, options []string) *SearchableSelect {
 	ss := &SearchableSelect{win: win, highlight: -1, placeholder: placeholder}
 	ss.minWidth = 220
+	ss.allowEmpty = true
+	ss.emptyLabel = "Not selected"
+	ss.selectedSet = make(map[string]struct{})
 
 	ss.label = widget.NewLabel("")
 	ss.label.Alignment = fyne.TextAlignLeading
@@ -189,7 +201,18 @@ func NewSearchableSelect(win fyne.Window, placeholder string, options []string) 
 			btn.Enable()
 			if int(i) >= 0 && int(i) < len(ss.filtered) {
 				val := ss.filtered[i]
-				lbl.SetText(val)
+				selected := ss.isSelectedValue(val)
+				if val == "" {
+					if ss.multi && selected {
+						lbl.SetText("✓ " + ss.emptyLabel)
+					} else {
+						lbl.SetText(ss.emptyLabel)
+					}
+				} else if ss.multi && selected {
+					lbl.SetText("✓ " + val)
+				} else {
+					lbl.SetText(val)
+				}
 				btn.onTapped = func() {
 					ss.highlight = int(i)
 					ss.list.Select(i)
@@ -215,8 +238,8 @@ func NewSearchableSelect(win fyne.Window, placeholder string, options []string) 
 
 	ss.root = container.NewVBox(
 		container.NewPadded(ss.search),
-		widget.NewSeparator(),
 		container.NewPadded(ss.scroll),
+		widget.NewSeparator(),
 	)
 
 	ss.open = false
@@ -407,10 +430,63 @@ func (ss *SearchableSelect) HidePopup() {
 	ss.syncOpenState()
 }
 
-func (ss *SearchableSelect) Selected() string { return ss.selected }
+func (ss *SearchableSelect) Selected() string {
+	if ss.multi {
+		return strings.Join(ss.selectedValues, ", ")
+	}
+	return ss.selected
+}
+
+func (ss *SearchableSelect) SelectedValues() []string {
+	out := make([]string, len(ss.selectedValues))
+	copy(out, ss.selectedValues)
+	return out
+}
 
 func (ss *SearchableSelect) SetSelected(v string) {
-	ss.selected = strings.TrimSpace(v)
+	v = strings.TrimSpace(v)
+	if ss.multi {
+		if v == "" {
+			ss.setSelectedValues(nil)
+			ss.updateButtonLabel()
+			return
+		}
+		ss.setSelectedValues([]string{v})
+		ss.updateButtonLabel()
+		return
+	}
+	ss.selected = v
+	ss.updateButtonLabel()
+}
+
+func (ss *SearchableSelect) SetSelectedValues(values []string) {
+	if !ss.multi {
+		if len(values) > 0 {
+			ss.SetSelected(values[0])
+		} else {
+			ss.SetSelected("")
+		}
+		return
+	}
+	ss.setSelectedValues(values)
+	ss.updateButtonLabel()
+}
+
+func (ss *SearchableSelect) SetMultiSelect(multi bool) {
+	ss.multi = multi
+	if !ss.multi {
+		if len(ss.selectedValues) > 0 {
+			ss.selected = ss.selectedValues[0]
+		} else {
+			ss.selected = ""
+		}
+		ss.selectedValues = nil
+		ss.selectedSet = make(map[string]struct{})
+	} else {
+		ss.selected = ""
+	}
+	ss.applyFilter("")
+	ss.refreshListSelection()
 	ss.updateButtonLabel()
 }
 
@@ -423,6 +499,7 @@ func (ss *SearchableSelect) SetOptions(opts []string) {
 		}
 		ss.options = append(ss.options, s)
 	}
+	ss.normalizeSelectedValues()
 	q := ""
 	if ss.search != nil {
 		q = ss.search.Text
@@ -430,6 +507,22 @@ func (ss *SearchableSelect) SetOptions(opts []string) {
 	ss.applyFilter(q)
 	ss.refreshListSelection()
 	ss.updateButtonLabel()
+}
+
+func (ss *SearchableSelect) SetAllowEmpty(allow bool) {
+	ss.allowEmpty = allow
+	ss.applyFilter("")
+	ss.refreshListSelection()
+	ss.updateButtonLabel()
+}
+
+func (ss *SearchableSelect) SetEmptyLabel(label string) {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		label = "Not selected"
+	}
+	ss.emptyLabel = label
+	ss.list.Refresh()
 }
 
 func (ss *SearchableSelect) SetTextStyle(style fyne.TextStyle) {
@@ -456,6 +549,25 @@ func (ss *SearchableSelect) applyTextStyle() {
 }
 
 func (ss *SearchableSelect) updateButtonLabel() {
+	if ss.multi {
+		if len(ss.selectedValues) == 0 {
+			ph := strings.TrimSpace(ss.placeholder)
+			if ph == "" {
+				ph = "Select..."
+			}
+			ss.label.SetText(ph)
+			ss.applyTextStyle()
+			return
+		}
+		if len(ss.selectedValues) == 1 {
+			ss.label.SetText(ss.selectedValues[0])
+			ss.applyTextStyle()
+			return
+		}
+		ss.label.SetText(fmt.Sprintf("%d selected", len(ss.selectedValues)))
+		ss.applyTextStyle()
+		return
+	}
 	if ss.selected == "" {
 		ph := strings.TrimSpace(ss.placeholder)
 		if ph == "" {
@@ -482,6 +594,15 @@ func (ss *SearchableSelect) applyFilter(q string) {
 			}
 		}
 	}
+	if ss.allowEmpty {
+		label := ss.emptyLabel
+		if label == "" {
+			label = "Not selected"
+		}
+		if q == "" || strings.Contains(strings.ToLower(label), qLower) {
+			ss.filtered = append([]string{""}, ss.filtered...)
+		}
+	}
 	// No implicit highlight on filter change.
 	ss.highlight = -1
 	ss.list.UnselectAll()
@@ -496,6 +617,20 @@ func (ss *SearchableSelect) refreshListSelection() {
 		return
 	}
 
+	if ss.multi {
+		if ss.highlight >= 0 {
+			ss.list.Select(widget.ListItemID(ss.highlight))
+			return
+		}
+		if ss.allowEmpty && len(ss.selectedValues) == 0 && ss.filtered[0] == "" {
+			ss.highlight = 0
+			ss.list.Select(widget.ListItemID(0))
+			return
+		}
+		ss.highlight = -1
+		return
+	}
+
 	// If we have a selected value, highlight it in the filtered list.
 	if ss.selected != "" {
 		for i, s := range ss.filtered {
@@ -506,6 +641,10 @@ func (ss *SearchableSelect) refreshListSelection() {
 				return
 			}
 		}
+	} else if ss.allowEmpty && ss.filtered[0] == "" {
+		ss.highlight = 0
+		ss.list.Select(widget.ListItemID(0))
+		return
 	}
 
 	// Otherwise no explicit highlight.
@@ -552,6 +691,22 @@ func (ss *SearchableSelect) pickByFilteredIndex(idx int) {
 		return
 	}
 	v := ss.filtered[idx]
+	if ss.multi {
+		if v == "" && ss.allowEmpty {
+			ss.setSelectedValues(nil)
+		} else {
+			ss.toggleSelectedValue(v)
+		}
+		ss.applyTextStyle()
+		ss.updateButtonLabel()
+		if ss.OnChanged != nil {
+			ss.OnChanged(ss.Selected())
+		}
+		if ss.OnChangedMulti != nil {
+			ss.OnChangedMulti(ss.SelectedValues())
+		}
+		return
+	}
 	ss.SetSelected(v)
 	if ss.OnChanged != nil {
 		ss.OnChanged(v)
@@ -687,10 +842,75 @@ func (ss *SearchableSelect) Options() []string {
 
 // Clear resets selection and search text.
 func (ss *SearchableSelect) Clear() {
+	if ss.multi {
+		ss.setSelectedValues(nil)
+		ss.updateButtonLabel()
+		if ss.OnChangedMulti != nil {
+			ss.OnChangedMulti(ss.SelectedValues())
+		}
+		return
+	}
 	ss.SetSelected("")
 	if ss.search != nil {
 		ss.search.SetText("")
 	}
+}
+
+func (ss *SearchableSelect) isSelectedValue(val string) bool {
+	if val == "" {
+		return ss.allowEmpty && len(ss.selectedValues) == 0
+	}
+	_, ok := ss.selectedSet[val]
+	return ok
+}
+
+func (ss *SearchableSelect) setSelectedValues(values []string) {
+	ss.selectedSet = make(map[string]struct{})
+	ss.selectedValues = ss.selectedValues[:0]
+	if len(values) == 0 {
+		return
+	}
+	for _, opt := range ss.options {
+		for _, v := range values {
+			if opt == v {
+				if _, ok := ss.selectedSet[v]; ok {
+					continue
+				}
+				ss.selectedSet[v] = struct{}{}
+				ss.selectedValues = append(ss.selectedValues, v)
+				break
+			}
+		}
+	}
+}
+
+func (ss *SearchableSelect) toggleSelectedValue(v string) {
+	if v == "" {
+		return
+	}
+	if _, ok := ss.selectedSet[v]; ok {
+		delete(ss.selectedSet, v)
+		ss.rebuildSelectedValues()
+		return
+	}
+	ss.selectedSet[v] = struct{}{}
+	ss.rebuildSelectedValues()
+}
+
+func (ss *SearchableSelect) rebuildSelectedValues() {
+	ss.selectedValues = ss.selectedValues[:0]
+	for _, opt := range ss.options {
+		if _, ok := ss.selectedSet[opt]; ok {
+			ss.selectedValues = append(ss.selectedValues, opt)
+		}
+	}
+}
+
+func (ss *SearchableSelect) normalizeSelectedValues() {
+	if !ss.multi {
+		return
+	}
+	ss.rebuildSelectedValues()
 }
 
 // colorTransparent returns a fully transparent color.

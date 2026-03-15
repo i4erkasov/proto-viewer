@@ -246,14 +246,21 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 	})
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
-		if !isTreeTab() {
+		if isTreeTab() {
+			v := jsonTree.SelectedValueString()
+			if strings.TrimSpace(v) == "" {
+				return
+			}
+			w.Clipboard().SetContent(v)
 			return
 		}
-		v := jsonTree.SelectedValueString()
-		if strings.TrimSpace(v) == "" {
-			return
+		if isJSONTab() {
+			v := jsonMarkdown.SelectedKeyValueString()
+			if strings.TrimSpace(v) == "" {
+				return
+			}
+			w.Clipboard().SetContent(v)
 		}
-		w.Clipboard().SetContent(v)
 	})
 	setSearchVisible(false)
 	setJSONSearchVisible(false)

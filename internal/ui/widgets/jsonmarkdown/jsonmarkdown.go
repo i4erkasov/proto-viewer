@@ -46,6 +46,7 @@ type JSONMarkdownView struct {
 	tgrid   *widget.TextGrid
 	overlay *tapOverlay
 	scroll  *container.Scroll
+	win     fyne.Window
 
 	searchEntry     *escEntry
 	searchUp        *widget.Button
@@ -61,9 +62,15 @@ type JSONMarkdownView struct {
 	matchIndex      int
 	highlights      map[int][]highlightRange
 
+	selectedKeyLine    int
+	selectedKeyRange   highlightRange
+	selectedKeyValue   string
+	selectedValueLine  int
+	selectedValueRange highlightRange
+	selectedValueText  string
+
 	searchKeySelect *searchselect.SearchableSelect
 	searchKeyWidth  float32
-	searchKey       string
 	searchKeys      []string
 	searchKeyIndex  map[string][]int
 	searchLower     []string
@@ -92,8 +99,11 @@ type keyRange struct {
 // NewJSONMarkdownView creates a markdown view with lazy loading.
 func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 	v := &JSONMarkdownView{chunk: defaultChunkLines}
+	v.selectedKeyLine = -1
+	v.selectedValueLine = -1
+	v.win = win
 	v.tgrid = widget.NewTextGrid()
-	v.overlay = newTapOverlay(v.handleTap)
+	v.overlay = newTapOverlay(v.handleTap, v.handleSecondaryTap)
 	// styles applied per cell
 	padTop := canvas.NewRectangle(color.Transparent)
 	padTop.SetMinSize(fyne.NewSize(1, theme.Padding()))
@@ -118,15 +128,24 @@ func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 	v.searchKeySelect = searchselect.NewSearchableSelect(win, searchKeyPrompt, nil)
 	v.searchKeySelect.SetTextStyle(fyne.TextStyle{})
 	v.searchKeySelect.SetMinWidth(200)
-	v.searchKeySelect.OnChanged = func(s string) {
+	v.searchKeySelect.SetMultiSelect(true)
+	v.searchKeySelect.OnChangedMulti = func(keys []string) {
+		selected := normalizeKeys(keys)
 		v.mu.Lock()
-		v.searchKey = strings.TrimSpace(s)
-		key := v.searchKey
+		v.searchKeys = selected
 		v.mu.Unlock()
-		v.applyKeyFilter(key)
+		v.applyKeyFilterKeys(selected)
 		v.applySearchAsync(v.searchEntry.Text)
 	}
-	v.searchKeySelect.SetSelected("")
+	v.searchKeySelect.OnChanged = func(s string) {
+		selected := normalizeKeys([]string{s})
+		v.mu.Lock()
+		v.searchKeys = selected
+		v.mu.Unlock()
+		v.applyKeyFilterKeys(selected)
+		v.applySearchAsync(v.searchEntry.Text)
+	}
+	v.searchKeySelect.SetSelectedValues(nil)
 	v.searchKeyWidth = 200
 
 	v.searchUp = widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
@@ -264,7 +283,6 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.matchIndex = -1
 	v.highlights = nil
 	v.searchQuery = ""
-	v.searchKey = ""
 	v.searchKeys = nil
 	v.searchKeyIndex = nil
 	v.searchLower = nil
@@ -273,6 +291,12 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchKeyFold = nil
 	v.searchMatchSet = nil
 	v.lineNumWidth = 0
+	v.selectedKeyLine = -1
+	v.selectedKeyRange = highlightRange{}
+	v.selectedKeyValue = ""
+	v.selectedValueLine = -1
+	v.selectedValueRange = highlightRange{}
+	v.selectedValueText = ""
 	v.mu.Unlock()
 	v.SetSearchVisible(false)
 
@@ -390,28 +414,40 @@ func (v *JSONMarkdownView) setGrid(lines []string, lineMap []int) {
 		query := strings.TrimSpace(v.searchQuery)
 		matchSet := v.searchMatchSet
 		lineNumWidth := v.lineNumWidth
+		selectedLine := v.selectedKeyLine
+		selectedRange := v.selectedKeyRange
+		if v.selectedValueLine >= 0 {
+			selectedLine = v.selectedValueLine
+			selectedRange = v.selectedValueRange
+		}
 		v.mu.Unlock()
 		highlights := v.highlights
 		if query != "" && matchSet != nil {
 			highlights = buildVisibleHighlights(lines, lineMap, query, matchSet)
 		}
-		v.tgrid.Rows = buildTextGridRows(lines, lineMap, highlights, lineNumWidth)
+		v.tgrid.Rows = buildTextGridRows(lines, lineMap, highlights, lineNumWidth, selectedLine, selectedRange)
 		v.tgrid.Refresh()
 		v.scroll.Refresh()
 	})
 }
 
 func (v *JSONMarkdownView) applyKeyFilter(key string) {
+	v.applyKeyFilterKeys(normalizeKeys([]string{key}))
+}
+
+func (v *JSONMarkdownView) applyKeyFilterKeys(keys []string) {
 	v.mu.Lock()
-	if key == "" {
+	if len(keys) == 0 {
 		v.rebuildViewLinesLocked()
 	} else {
-		if v.searchKeyFold != nil {
-			if fs, ok := v.searchKeyFold[key]; ok {
-				v.folded[fs] = false
+		for _, key := range keys {
+			if v.searchKeyFold != nil {
+				if fs, ok := v.searchKeyFold[key]; ok {
+					v.folded[fs] = false
+				}
 			}
+			v.rebuildViewLinesForKeysLocked(keys)
 		}
-		v.rebuildViewLinesForKeyLocked(key)
 	}
 	v.loaded = minInt(v.chunk, len(v.viewLines))
 	lines := v.viewLines
@@ -426,62 +462,78 @@ func (v *JSONMarkdownView) applyKeyFilter(key string) {
 	}
 }
 
-func (v *JSONMarkdownView) rebuildViewLinesForKeyLocked(key string) {
+func (v *JSONMarkdownView) rebuildViewLinesForKeysLocked(keys []string) {
 	v.viewLines = v.viewLines[:0]
 	v.lineMap = v.lineMap[:0]
-	if key == "" || len(v.fullLines) == 0 || v.searchKeyRanges == nil {
+	if len(keys) == 0 || len(v.fullLines) == 0 || v.searchKeyRanges == nil {
 		return
 	}
-	rng, ok := v.searchKeyRanges[key]
-	if !ok {
+
+	type keyBlock struct {
+		start     int
+		end       int
+		foldStart int
+	}
+	blocks := make([]keyBlock, 0, len(keys))
+	for _, key := range keys {
+		rng, ok := v.searchKeyRanges[key]
+		if !ok {
+			continue
+		}
+		foldStart := -1
+		if v.searchKeyFold != nil {
+			if fs, ok := v.searchKeyFold[key]; ok {
+				foldStart = fs
+			}
+		}
+		blocks = append(blocks, keyBlock{start: rng.start, end: rng.end, foldStart: foldStart})
+	}
+	if len(blocks) == 0 {
 		return
 	}
-	foldStart := -1
-	if v.searchKeyFold != nil {
-		if fs, ok := v.searchKeyFold[key]; ok {
-			foldStart = fs
+	sort.Slice(blocks, func(i, j int) bool { return blocks[i].start < blocks[j].start })
+
+	for _, block := range blocks {
+		start := block.start
+		end := block.end
+		if start < 0 {
+			start = 0
 		}
-	}
-	start := rng.start
-	end := rng.end
-	if start < 0 {
-		start = 0
-	}
-	if end >= len(v.fullLines) {
-		end = len(v.fullLines) - 1
-	}
-	for i := start; i <= end; {
-		if i < 0 || i >= len(v.fullLines) {
-			break
+		if end >= len(v.fullLines) {
+			end = len(v.fullLines) - 1
 		}
-		if i == start && foldStart == i+1 {
-			if foldEnd, ok := v.foldRanges[foldStart]; ok && foldEnd > foldStart && v.folded[foldStart] {
+		for i := start; i <= end; {
+			if i < 0 || i >= len(v.fullLines) {
+				break
+			}
+			if i == start && block.foldStart == i+1 {
+				if foldEnd, ok := v.foldRanges[block.foldStart]; ok && foldEnd > block.foldStart && v.folded[block.foldStart] {
+					clampedEnd := foldEnd
+					if clampedEnd > end {
+						clampedEnd = end
+					}
+					v.viewLines = append(v.viewLines, v.fullLines[i])
+					v.lineMap = append(v.lineMap, i)
+					v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[block.foldStart]))
+					v.lineMap = append(v.lineMap, block.foldStart)
+					i = clampedEnd + 1
+					continue
+				}
+			}
+			if foldEnd, ok := v.foldRanges[i]; ok && foldEnd > i && v.folded[i] {
 				clampedEnd := foldEnd
 				if clampedEnd > end {
 					clampedEnd = end
 				}
-				// Keep the key line visible and fold the brace line below it.
-				v.viewLines = append(v.viewLines, v.fullLines[i])
+				v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[i]))
 				v.lineMap = append(v.lineMap, i)
-				v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[foldStart]))
-				v.lineMap = append(v.lineMap, foldStart)
 				i = clampedEnd + 1
 				continue
 			}
-		}
-		if foldEnd, ok := v.foldRanges[i]; ok && foldEnd > i && v.folded[i] {
-			clampedEnd := foldEnd
-			if clampedEnd > end {
-				clampedEnd = end
-			}
-			v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[i]))
+			v.viewLines = append(v.viewLines, v.fullLines[i])
 			v.lineMap = append(v.lineMap, i)
-			i = clampedEnd + 1
-			continue
+			i++
 		}
-		v.viewLines = append(v.viewLines, v.fullLines[i])
-		v.lineMap = append(v.lineMap, i)
-		i++
 	}
 }
 
@@ -496,7 +548,7 @@ func (v *JSONMarkdownView) setSearchKeys(keys []string) {
 			return
 		}
 		v.searchKeySelect.SetOptions(opts)
-		v.searchKeySelect.SetSelected("")
+		v.searchKeySelect.SetSelectedValues(nil)
 		v.searchKeySelect.Refresh()
 	})
 }
@@ -581,13 +633,14 @@ func isNumberChar(r rune) bool {
 	return unicode.IsDigit(r) || r == '.' || r == 'e' || r == 'E' || r == '+' || r == '-'
 }
 
-func buildTextGridRows(lines []string, lineMap []int, highlights map[int][]highlightRange, lineNumWidth int) []widget.TextGridRow {
+func buildTextGridRows(lines []string, lineMap []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange) []widget.TextGridRow {
 	if len(lines) == 0 {
 		return nil
 	}
 	rows := make([]widget.TextGridRow, 0, len(lines))
 	for i, line := range lines {
 		var hl []highlightRange
+		var sel highlightRange
 		var prefix string
 		if lineMap != nil && i < len(lineMap) {
 			lineNum := lineMap[i] + 1
@@ -595,14 +648,17 @@ func buildTextGridRows(lines []string, lineMap []int, highlights map[int][]highl
 			if highlights != nil {
 				hl = highlights[lineMap[i]]
 			}
+			if lineMap[i] == selectedLine {
+				sel = selectedRange
+			}
 		}
-		cells := buildTextGridCells(prefix+line, hl, len(prefix))
+		cells := buildTextGridCells(prefix+line, hl, len(prefix), sel)
 		rows = append(rows, widget.TextGridRow{Cells: cells})
 	}
 	return rows
 }
 
-func buildTextGridCells(line string, highlights []highlightRange, prefixLen int) []widget.TextGridCell {
+func buildTextGridCells(line string, highlights []highlightRange, prefixLen int, selected highlightRange) []widget.TextGridCell {
 	if line == "" {
 		return nil
 	}
@@ -625,6 +681,16 @@ func buildTextGridCells(line string, highlights []highlightRange, prefixLen int)
 		}
 		return adj >= highlights[rangeIndex].start && adj < highlights[rangeIndex].end
 	}
+	inSelected := func(i int) bool {
+		if selected.start == 0 && selected.end == 0 {
+			return false
+		}
+		if i < prefixLen {
+			return false
+		}
+		adj := i - prefixLen
+		return adj >= selected.start && adj < selected.end
+	}
 	flush := func() {
 		if pending == "" {
 			return
@@ -633,6 +699,9 @@ func buildTextGridCells(line string, highlights []highlightRange, prefixLen int)
 			style := &widget.CustomTextGridStyle{FGColor: pendingColor}
 			if inHighlight(pos) {
 				style.BGColor = highlightColor()
+			}
+			if inSelected(pos) {
+				style.TextStyle = fyne.TextStyle{Bold: true}
 			}
 			if pos < prefixLen {
 				style.BGColor = lineNumberBgColor()
@@ -761,11 +830,12 @@ func buildTextGridCells(line string, highlights []highlightRange, prefixLen int)
 // tapOverlay captures clicks over the TextGrid to toggle folds.
 type tapOverlay struct {
 	widget.BaseWidget
-	onTap func(pos fyne.Position)
+	onTap       func(pos fyne.Position)
+	onSecondary func(pos fyne.Position)
 }
 
-func newTapOverlay(onTap func(pos fyne.Position)) *tapOverlay {
-	o := &tapOverlay{onTap: onTap}
+func newTapOverlay(onTap func(pos fyne.Position), onSecondary func(pos fyne.Position)) *tapOverlay {
+	o := &tapOverlay{onTap: onTap, onSecondary: onSecondary}
 	o.ExtendBaseWidget(o)
 	return o
 }
@@ -773,6 +843,12 @@ func newTapOverlay(onTap func(pos fyne.Position)) *tapOverlay {
 func (o *tapOverlay) Tapped(ev *fyne.PointEvent) {
 	if o.onTap != nil {
 		o.onTap(ev.Position)
+	}
+}
+
+func (o *tapOverlay) TappedSecondary(ev *fyne.PointEvent) {
+	if o.onSecondary != nil {
+		o.onSecondary(ev.Position)
 	}
 }
 
@@ -827,9 +903,22 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 		prefixLen = lineNumWidth + 2
 	}
 	if col < prefixLen {
+		v.clearSelectedKey()
+		v.clearSelectedValue()
+		v.refreshSelection()
 		return
 	}
-	if !isInteractiveCell(viewLine, col-prefixLen) {
+	colAdj := col - prefixLen
+	if key, rng, ok := keyAtCol(viewLine, colAdj); ok {
+		v.setSelectedKey(srcLine, rng, key)
+	} else if val, vrng, ok := valueAtCol(viewLine, colAdj); ok {
+		v.setSelectedValue(srcLine, vrng, val)
+	} else {
+		v.clearSelectedKey()
+		v.clearSelectedValue()
+	}
+	if !isInteractiveCell(viewLine, colAdj) {
+		v.refreshSelection()
 		return
 	}
 
@@ -837,11 +926,12 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 	end, ok := v.foldRanges[srcLine]
 	if !ok || end <= srcLine {
 		v.mu.Unlock()
+		v.refreshSelection()
 		return
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
-	if v.searchKey != "" {
-		v.rebuildViewLinesForKeyLocked(v.searchKey)
+	if len(v.searchKeys) > 0 {
+		v.rebuildViewLinesForKeysLocked(v.searchKeys)
 	} else {
 		v.rebuildViewLinesLocked()
 	}
@@ -870,6 +960,204 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 			v.scroll.ScrollToOffset(offset)
 		}
 	})
+}
+
+func (v *JSONMarkdownView) handleSecondaryTap(pos fyne.Position) {
+	if v.tgrid == nil || v.win == nil {
+		return
+	}
+	row, col := v.tgrid.CursorLocationForPosition(pos)
+	if row < 0 {
+		return
+	}
+
+	v.mu.Lock()
+	if row >= len(v.lineMap) {
+		v.mu.Unlock()
+		return
+	}
+	lineNumWidth := v.lineNumWidth
+	viewLine := ""
+	if row < len(v.viewLines) {
+		viewLine = v.viewLines[row]
+	}
+	srcLine := v.lineMap[row]
+	v.mu.Unlock()
+
+	prefixLen := 0
+	if lineNumWidth > 0 {
+		prefixLen = lineNumWidth + 2
+	}
+	if col < prefixLen {
+		return
+	}
+	colAdj := col - prefixLen
+
+	keyText, keyRange, keyOk := keyAtCol(viewLine, colAdj)
+	valText, valRange, valOk := valueAtCol(viewLine, colAdj)
+	fullKey, fullVal, kvOk := extractKeyValue(viewLine)
+	fullBlockVal, blockOk := v.fullValueForLine(srcLine)
+
+	if keyOk {
+		v.setSelectedKey(srcLine, keyRange, keyText)
+	} else if valOk {
+		v.setSelectedValue(srcLine, valRange, valText)
+	} else {
+		return
+	}
+	v.refreshSelection()
+
+	if blockOk {
+		fullVal = fullBlockVal
+	}
+	if !kvOk {
+		fullKey = keyText
+		if !blockOk {
+			fullVal = ""
+		}
+	}
+	if strings.TrimSpace(fullKey) == "" && strings.TrimSpace(keyText) != "" {
+		fullKey = keyText
+	}
+	if strings.TrimSpace(fullVal) == "" && strings.TrimSpace(valText) != "" {
+		fullVal = valText
+	}
+
+	keyItem := fyne.NewMenuItem("Copy", func() {
+		if fullKey != "" && fullVal != "" {
+			v.win.Clipboard().SetContent(wrapCopyContent(fullKey + ": " + fullVal))
+			return
+		}
+		if fullKey != "" {
+			v.win.Clipboard().SetContent(wrapCopyContent(fullKey))
+			return
+		}
+		if fullVal != "" {
+			v.win.Clipboard().SetContent(wrapCopyContent(fullVal))
+		}
+	})
+	if strings.TrimSpace(fullKey) == "" && strings.TrimSpace(fullVal) == "" {
+		keyItem.Disabled = true
+	}
+	valItem := fyne.NewMenuItem("Copy value", func() {
+		if fullVal != "" {
+			v.win.Clipboard().SetContent(fullVal)
+		}
+	})
+	if strings.TrimSpace(fullVal) == "" {
+		valItem.Disabled = true
+	}
+
+	menu := fyne.NewMenu("", keyItem, valItem)
+
+	absPos := pos
+	if d := fyne.CurrentApp().Driver(); d != nil {
+		base := d.AbsolutePositionForObject(v.overlay)
+		absPos = fyne.NewPos(base.X+pos.X, base.Y+pos.Y)
+	}
+	widget.ShowPopUpMenuAtPosition(menu, v.win.Canvas(), absPos)
+}
+
+func (v *JSONMarkdownView) setSelectedKey(line int, rng highlightRange, key string) {
+	v.mu.Lock()
+	v.selectedKeyLine = line
+	v.selectedKeyRange = rng
+	v.selectedKeyValue = key
+	v.selectedValueLine = -1
+	v.selectedValueRange = highlightRange{}
+	v.selectedValueText = ""
+	v.mu.Unlock()
+}
+
+func (v *JSONMarkdownView) setSelectedValue(line int, rng highlightRange, val string) {
+	v.mu.Lock()
+	v.selectedValueLine = line
+	v.selectedValueRange = rng
+	v.selectedValueText = val
+	v.selectedKeyLine = -1
+	v.selectedKeyRange = highlightRange{}
+	v.selectedKeyValue = ""
+	v.mu.Unlock()
+}
+
+func (v *JSONMarkdownView) clearSelectedKey() {
+	v.mu.Lock()
+	v.selectedKeyLine = -1
+	v.selectedKeyRange = highlightRange{}
+	v.selectedKeyValue = ""
+	v.mu.Unlock()
+}
+
+func (v *JSONMarkdownView) clearSelectedValue() {
+	v.mu.Lock()
+	v.selectedValueLine = -1
+	v.selectedValueRange = highlightRange{}
+	v.selectedValueText = ""
+	v.mu.Unlock()
+}
+
+func (v *JSONMarkdownView) refreshSelection() {
+	v.mu.Lock()
+	lines := v.viewLines
+	lineMap := v.lineMap
+	loaded := v.loaded
+	v.mu.Unlock()
+	if loaded > 0 {
+		v.setGrid(lines[:loaded], lineMap[:loaded])
+	} else {
+		v.setGrid(nil, nil)
+	}
+}
+
+func keyAtCol(line string, col int) (string, highlightRange, bool) {
+	start, end, ok := findKeyRange(line)
+	if !ok {
+		return "", highlightRange{}, false
+	}
+	if col < start || col > end {
+		return "", highlightRange{}, false
+	}
+	runes := []rune(line)
+	if start+1 > end-1 || start < 0 || end >= len(runes) {
+		return "", highlightRange{}, false
+	}
+	keyRunes := runes[start+1 : end]
+	key := string(keyRunes)
+	if unq, err := strconv.Unquote("\"" + key + "\""); err == nil {
+		key = unq
+	}
+	return key, highlightRange{start: start, end: end}, true
+}
+
+func valueAtCol(line string, col int) (string, highlightRange, bool) {
+	val, rng, ok := findValueRange(line)
+	if !ok {
+		return "", highlightRange{}, false
+	}
+	if col < rng.start || col > rng.end {
+		return "", highlightRange{}, false
+	}
+	return val, rng, true
+}
+
+func extractKeyValue(line string) (string, string, bool) {
+	keyStart, keyEnd, ok := findKeyRange(line)
+	if !ok {
+		return "", "", false
+	}
+	runes := []rune(line)
+	if keyStart+1 > keyEnd-1 || keyStart < 0 || keyEnd >= len(runes) {
+		return "", "", false
+	}
+	key := string(runes[keyStart+1 : keyEnd])
+	if unq, err := strconv.Unquote("\"" + key + "\""); err == nil {
+		key = unq
+	}
+	val, _, ok := findValueRange(line)
+	if !ok {
+		return key, "", false
+	}
+	return key, val, true
 }
 
 func isInteractiveCell(line string, col int) bool {
@@ -962,6 +1250,77 @@ func singleBraceIndex(line string) (int, bool) {
 	return 0, false
 }
 
+func findValueRange(line string) (string, highlightRange, bool) {
+	_, keyEnd, ok := findKeyRange(line)
+	if !ok {
+		return "", highlightRange{}, false
+	}
+	runes := []rune(line)
+	if keyEnd+1 >= len(runes) {
+		return "", highlightRange{}, false
+	}
+	idx := keyEnd + 1
+	for idx < len(runes) && runes[idx] != ':' {
+		idx++
+	}
+	if idx >= len(runes) {
+		return "", highlightRange{}, false
+	}
+	idx++
+	for idx < len(runes) && unicode.IsSpace(runes[idx]) {
+		idx++
+	}
+	if idx >= len(runes) {
+		return "", highlightRange{}, false
+	}
+	start := idx
+	if runes[idx] == '"' {
+		idx++
+		esc := false
+		for idx < len(runes) {
+			r := runes[idx]
+			if esc {
+				esc = false
+				idx++
+				continue
+			}
+			if r == '\\' {
+				esc = true
+				idx++
+				continue
+			}
+			if r == '"' {
+				idx++
+				break
+			}
+			idx++
+		}
+		end := idx - 1
+		val := string(runes[start+1 : end])
+		if unq, err := strconv.Unquote("\"" + val + "\""); err == nil {
+			val = unq
+		}
+		return val, highlightRange{start: start, end: end}, true
+	}
+	for idx < len(runes) {
+		r := runes[idx]
+		if r == ',' || r == '}' || r == ']' {
+			break
+		}
+		if r == '\n' || r == '\r' {
+			break
+		}
+		idx++
+	}
+	end := idx - 1
+	val := strings.TrimSpace(string(runes[start:idx]))
+	if strings.HasSuffix(val, ",") {
+		val = strings.TrimSpace(strings.TrimSuffix(val, ","))
+		end = start + len([]rune(val)) - 1
+	}
+	return val, highlightRange{start: start, end: end}, true
+}
+
 // --- end JSON color palette
 
 func (v *JSONMarkdownView) onSearchChanged(s string) {
@@ -995,16 +1354,19 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	seq := atomic.AddUint64(&v.searchSeq, 1)
 
 	v.mu.Lock()
-	key := v.searchKey
+	keys := v.searchKeys
 	index := v.searchKeyIndex
 	allLines := v.searchAll
 	keyRanges := v.searchKeyRanges
 	lowerLines := v.searchLower
 	fullLines := v.fullLines
-	if key != "" && keyRanges != nil {
-		if rng, ok := keyRanges[key]; ok {
-			if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
-				v.rebuildViewLinesForKeyLocked(key)
+	if len(keys) > 0 && keyRanges != nil {
+		for _, k := range keys {
+			if rng, ok := keyRanges[k]; ok {
+				if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
+					v.rebuildViewLinesForKeysLocked(keys)
+					break
+				}
 			}
 		}
 	}
@@ -1036,10 +1398,10 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	}
 
 	var candidates []int
-	if key == "" {
+	if len(keys) == 0 {
 		candidates = allLines
 	} else {
-		candidates = index[key]
+		candidates = unionCandidateLines(index, keys)
 	}
 
 	go func(seq uint64, lower string, candidates []int, lowerLines, fullLines []string) {
@@ -1150,10 +1512,13 @@ func (v *JSONMarkdownView) navigateMatch(step int) {
 	if v.expandForLineLocked(line) {
 		v.rebuildViewLinesLocked()
 	}
-	if v.searchKey != "" {
-		if rng, ok := v.searchKeyRanges[v.searchKey]; ok {
-			if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
-				v.rebuildViewLinesForKeyLocked(v.searchKey)
+	if len(v.searchKeys) > 0 {
+		for _, k := range v.searchKeys {
+			if rng, ok := v.searchKeyRanges[k]; ok {
+				if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
+					v.rebuildViewLinesForKeysLocked(v.searchKeys)
+					break
+				}
 			}
 		}
 	}
@@ -1559,4 +1924,152 @@ func isDarkColor(c color.Color) bool {
 	bl := float64(b) / 65535.0
 	lum := 0.2126*rl + 0.7152*gl + 0.0722*bl
 	return lum < 0.5
+}
+
+func (v *JSONMarkdownView) SelectedKeyValueString() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.selectedValueLine >= 0 {
+		if val, ok := v.fullValueForLineLocked(v.selectedValueLine); ok {
+			return wrapCopyContent(strings.TrimSpace(val))
+		}
+	}
+	if strings.TrimSpace(v.selectedValueText) != "" {
+		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
+	}
+	return wrapCopyContent(strings.TrimSpace(v.selectedKeyValue))
+}
+
+func (v *JSONMarkdownView) fullValueForLine(srcLine int) (string, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.fullValueForLineLocked(srcLine)
+}
+
+func (v *JSONMarkdownView) fullValueForLineLocked(srcLine int) (string, bool) {
+	if srcLine < 0 || srcLine >= len(v.fullLines) {
+		return "", false
+	}
+	line := v.fullLines[srcLine]
+	val, rng, ok := findValueRange(line)
+	if !ok {
+		return "", false
+	}
+	val = strings.TrimSpace(val)
+	if val != "{" && val != "[" {
+		return "", false
+	}
+	braceIdx := rng.start
+	brace := rune(val[0])
+	closing := '}'
+	if brace == '[' {
+		closing = ']'
+	}
+
+	depth := 0
+	inString := false
+	esc := false
+	out := make([]string, 0, 16)
+
+	for i := srcLine; i < len(v.fullLines); i++ {
+		ln := v.fullLines[i]
+		runes := []rune(ln)
+		startCol := 0
+		if i == srcLine {
+			startCol = braceIdx
+		}
+		var buf strings.Builder
+
+		for j, r := range runes {
+			if j >= startCol {
+				buf.WriteRune(r)
+			}
+
+			if inString {
+				if esc {
+					esc = false
+					continue
+				}
+				if r == '\\' {
+					esc = true
+					continue
+				}
+				if r == '"' {
+					inString = false
+				}
+				continue
+			}
+			if r == '"' {
+				inString = true
+				continue
+			}
+
+			if r == brace {
+				depth++
+			} else if r == closing {
+				depth--
+				if depth == 0 {
+					out = append(out, buf.String())
+					return strings.Join(out, "\n"), true
+				}
+			}
+		}
+
+		if buf.Len() > 0 {
+			out = append(out, buf.String())
+		} else if i > srcLine {
+			out = append(out, "")
+		}
+	}
+	return "", false
+}
+
+func wrapCopyContent(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return s
+	}
+	if strings.Contains(trimmed, "\n") {
+		return "{\n" + trimmed + "\n}"
+	}
+	return "{" + trimmed + "}"
+}
+
+func normalizeKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+func unionCandidateLines(index map[string][]int, keys []string) []int {
+	if len(keys) == 0 || index == nil {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	out := make([]int, 0)
+	for _, k := range keys {
+		for _, ln := range index[k] {
+			if _, ok := seen[ln]; ok {
+				continue
+			}
+			seen[ln] = struct{}{}
+			out = append(out, ln)
+		}
+	}
+	sort.Ints(out)
+	return out
 }
