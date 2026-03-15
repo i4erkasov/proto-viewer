@@ -2,7 +2,6 @@ package ui
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"image/color"
 	"os"
@@ -23,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/bytedance/sonic"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsonmarkdown"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsontree"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/protopicker"
@@ -484,14 +484,14 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return nil
 		}
 		var list []string
-		if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		if err := sonic.Unmarshal([]byte(raw), &list); err != nil {
 			return nil
 		}
 		return list
 	}
 
 	savePresetIndex := func(list []string) {
-		b, err := json.Marshal(list)
+		b, err := sonic.Marshal(list)
 		if err != nil {
 			return
 		}
@@ -499,7 +499,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	}
 
 	savePreset := func(name string, p presetEntry) {
-		b, err := json.Marshal(p)
+		b, err := sonic.Marshal(p)
 		if err != nil {
 			return
 		}
@@ -522,7 +522,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return presetEntry{}, false
 		}
 		var p presetEntry
-		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		if err := sonic.Unmarshal([]byte(raw), &p); err != nil {
 			return presetEntry{}, false
 		}
 		return p, true
@@ -921,8 +921,8 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			jsonText := res.Raw
 			if len(jsonText) <= 512_000 {
 				var v any
-				if err := json.Unmarshal([]byte(jsonText), &v); err == nil {
-					if pretty, err := json.MarshalIndent(v, "", "  "); err == nil {
+				if err := sonic.Unmarshal([]byte(jsonText), &v); err == nil {
+					if pretty, err := sonic.MarshalIndent(v, "", "  "); err == nil {
 						jsonText = string(pretty)
 					}
 				}

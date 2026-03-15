@@ -3,7 +3,6 @@
 package jsontree
 
 import (
-	"encoding/json"
 	"fmt"
 	"image/color"
 	"sort"
@@ -17,6 +16,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/bytedance/sonic"
 )
 
 const rootID = "root"
@@ -199,7 +199,7 @@ func (jt *SearchableJSONTree) SetJSON(jsonText string) {
 	}
 
 	var v any
-	if err := json.Unmarshal([]byte(jsonText), &v); err != nil {
+	if err := sonic.Unmarshal([]byte(jsonText), &v); err != nil {
 		jt.buildTree(jt.rootID, "root", "", map[string]any{"error": "invalid JSON"})
 	} else {
 		jt.buildTree(jt.rootID, "root", "", v)
@@ -630,7 +630,7 @@ func (jt *SearchableJSONTree) SelectedValueString() string {
 		return n.value
 	}
 	val := jt.nodeToValue(id)
-	b, err := json.MarshalIndent(val, "", "  ")
+	b, err := sonic.MarshalIndent(val, "", "  ")
 	if err != nil {
 		return ""
 	}
@@ -653,7 +653,7 @@ func (jt *SearchableJSONTree) nodeToValue(id string) any {
 			return []any{}
 		}
 		var v any
-		if err := json.Unmarshal([]byte(n.value), &v); err == nil {
+		if err := sonic.Unmarshal([]byte(n.value), &v); err == nil {
 			return v
 		}
 		return n.value
@@ -803,7 +803,7 @@ func formatScalar(v any) string {
 	case nil:
 		return "null"
 	case string:
-		b, _ := json.Marshal(t)
+		b, _ := sonic.Marshal(t)
 		return string(b)
 	case bool:
 		if t {
@@ -813,7 +813,7 @@ func formatScalar(v any) string {
 	case float64:
 		return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.6f", t), "0"), ".")
 	default:
-		b, err := json.Marshal(t)
+		b, err := sonic.Marshal(t)
 		if err == nil {
 			return string(b)
 		}

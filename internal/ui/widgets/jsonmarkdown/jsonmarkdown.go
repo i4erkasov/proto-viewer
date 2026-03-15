@@ -3,8 +3,6 @@
 package jsonmarkdown
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"image/color"
 	"sort"
@@ -21,6 +19,7 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"github.com/bytedance/sonic"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 )
 
@@ -48,6 +47,8 @@ type JSONMarkdownView struct {
 	scroll  *container.Scroll
 	win     fyne.Window
 
+	fullBuf *JSONBuffer
+
 	searchEntry      *escEntry
 	searchUp         *widget.Button
 	searchDown       *widget.Button
@@ -72,20 +73,20 @@ type JSONMarkdownView struct {
 	selectedValueRange highlightRange
 	selectedValueText  string
 
-	searchKeySelect *searchselect.SearchableSelect
-	searchKeyWidth  float32
-	searchKeys      []string
-	searchKeyIndex  map[string][]int
-	searchLower     []string
-	searchAll       []int
-	searchKeyRanges map[string]keyRange
-	searchKeyFold   map[string]int
-	searchSeq       uint64
-	searchMatchSet  map[int]struct{}
-	lineNumWidth    int
-	debounceMu      sync.Mutex
-	debounceTimer   *time.Timer
-	debounceQuery   string
+	searchKeySelect  *searchselect.SearchableSelect
+	searchKeyWidth   float32
+	searchKeys       []string
+	searchKeyIndex   map[string][]int
+	searchAll        []int
+	searchKeyRanges  map[string]keyRange
+	searchKeyFold    map[string]int
+	searchSeq        uint64
+	searchMatchSet   map[int]struct{}
+	searchQueryLower []byte
+	lineNumWidth     int
+	debounceMu       sync.Mutex
+	debounceTimer    *time.Timer
+	debounceQuery    string
 }
 
 // highlightRange represents a range of text to be highlighted.
@@ -315,11 +316,11 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchQuery = ""
 	v.searchKeys = nil
 	v.searchKeyIndex = nil
-	v.searchLower = nil
 	v.searchAll = nil
 	v.searchKeyRanges = nil
 	v.searchKeyFold = nil
 	v.searchMatchSet = nil
+	v.searchQueryLower = nil
 	v.lineNumWidth = 0
 	v.selectedKeyLine = -1
 	v.selectedKeyRange = highlightRange{}
@@ -338,34 +339,37 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 
 	var parsed any
 	pretty := s
-	if json.Valid([]byte(s)) {
-		if err := json.Unmarshal([]byte(s), &parsed); err == nil {
-			if b, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+	data := []byte(s)
+	if sonic.Valid(data) {
+		if err := sonic.Unmarshal(data, &parsed); err == nil {
+			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
 				pretty = string(b)
 			}
-		} else {
-			parsed = nil
-			var buf bytes.Buffer
-			if err := json.Indent(&buf, []byte(s), "", "  "); err == nil {
-				pretty = buf.String()
-			}
 		}
-		if !strings.Contains(pretty, "\n") {
-			var buf bytes.Buffer
-			if err := json.Indent(&buf, []byte(s), "", "  "); err == nil {
-				pretty = buf.String()
+		if !strings.Contains(pretty, "\n") && parsed != nil {
+			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
+				pretty = string(b)
 			}
 		}
 	}
 
-	lines := splitLines(pretty)
+	buf := newJSONBuffer(pretty)
+	lines := splitLinesFromBuffer(buf)
+	if len(lines) == 0 {
+		lines = splitLines(pretty)
+	}
 	foldRanges, foldDepths := buildFoldRangesWithDepth(lines)
 	topKeys := collectTopLevelKeys(parsed)
-	index, lower, keyRanges, allLines, keyFold := buildSearchIndex(lines, foldRanges)
-	lineNumWidth := len(strconv.Itoa(len(lines)))
+	index, keyRanges, allLines, keyFold := buildSearchIndex(lines, foldRanges)
+	lineCount := buf.LineCount()
+	if lineCount == 0 {
+		lineCount = len(lines)
+	}
+	lineNumWidth := len(strconv.Itoa(lineCount))
 
 	v.mu.Lock()
-	v.fullLines = lines
+	v.fullBuf = buf
+	v.fullLines = nil
 	v.foldRanges = foldRanges
 	v.folded = make(map[int]bool, len(foldRanges))
 	for start := range foldRanges {
@@ -374,7 +378,6 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 		}
 	}
 	v.searchKeyIndex = index
-	v.searchLower = lower
 	v.searchAll = allLines
 	v.searchKeyRanges = keyRanges
 	v.searchKeyFold = keyFold
@@ -495,7 +498,7 @@ func (v *JSONMarkdownView) applyKeyFilterKeys(keys []string) {
 func (v *JSONMarkdownView) rebuildViewLinesForKeysLocked(keys []string) {
 	v.viewLines = v.viewLines[:0]
 	v.lineMap = v.lineMap[:0]
-	if len(keys) == 0 || len(v.fullLines) == 0 || v.searchKeyRanges == nil {
+	if len(keys) == 0 || v.fullLineCountLocked() == 0 || v.searchKeyRanges == nil {
 		return
 	}
 
@@ -523,17 +526,18 @@ func (v *JSONMarkdownView) rebuildViewLinesForKeysLocked(keys []string) {
 	}
 	sort.Slice(blocks, func(i, j int) bool { return blocks[i].start < blocks[j].start })
 
+	lineCount := v.fullLineCountLocked()
 	for _, block := range blocks {
 		start := block.start
 		end := block.end
 		if start < 0 {
 			start = 0
 		}
-		if end >= len(v.fullLines) {
-			end = len(v.fullLines) - 1
+		if end >= lineCount {
+			end = lineCount - 1
 		}
 		for i := start; i <= end; {
-			if i < 0 || i >= len(v.fullLines) {
+			if i < 0 || i >= lineCount {
 				break
 			}
 			if i == start && block.foldStart == i+1 {
@@ -542,9 +546,9 @@ func (v *JSONMarkdownView) rebuildViewLinesForKeysLocked(keys []string) {
 					if clampedEnd > end {
 						clampedEnd = end
 					}
-					v.viewLines = append(v.viewLines, v.fullLines[i])
+					v.viewLines = append(v.viewLines, v.fullLineLocked(i))
 					v.lineMap = append(v.lineMap, i)
-					v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[block.foldStart]))
+					v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLineLocked(block.foldStart)))
 					v.lineMap = append(v.lineMap, block.foldStart)
 					i = clampedEnd + 1
 					continue
@@ -555,12 +559,12 @@ func (v *JSONMarkdownView) rebuildViewLinesForKeysLocked(keys []string) {
 				if clampedEnd > end {
 					clampedEnd = end
 				}
-				v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[i]))
+				v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLineLocked(i)))
 				v.lineMap = append(v.lineMap, i)
 				i = clampedEnd + 1
 				continue
 			}
-			v.viewLines = append(v.viewLines, v.fullLines[i])
+			v.viewLines = append(v.viewLines, v.fullLineLocked(i))
 			v.lineMap = append(v.lineMap, i)
 			i++
 		}
@@ -890,17 +894,17 @@ func (o *tapOverlay) CreateRenderer() fyne.WidgetRenderer {
 func (v *JSONMarkdownView) rebuildViewLinesLocked() {
 	v.viewLines = v.viewLines[:0]
 	v.lineMap = v.lineMap[:0]
-	if len(v.fullLines) == 0 {
+	if v.fullLineCountLocked() == 0 {
 		return
 	}
-	for i := 0; i < len(v.fullLines); {
+	for i := 0; i < v.fullLineCountLocked(); {
 		if end, ok := v.foldRanges[i]; ok && end > i && v.folded[i] {
-			v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[i]))
+			v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLineLocked(i)))
 			v.lineMap = append(v.lineMap, i)
 			i = end + 1
 			continue
 		}
-		v.viewLines = append(v.viewLines, v.fullLines[i])
+		v.viewLines = append(v.viewLines, v.fullLineLocked(i))
 		v.lineMap = append(v.lineMap, i)
 		i++
 	}
@@ -1383,7 +1387,6 @@ func (v *JSONMarkdownView) fireSearchDebounce() {
 
 func (v *JSONMarkdownView) applySearchAsync(q string) {
 	query := strings.TrimSpace(q)
-	lower := strings.ToLower(query)
 	seq := atomic.AddUint64(&v.searchSeq, 1)
 
 	v.mu.Lock()
@@ -1391,27 +1394,25 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	index := v.searchKeyIndex
 	allLines := v.searchAll
 	keyRanges := v.searchKeyRanges
-	lowerLines := v.searchLower
-	fullLines := v.fullLines
-	if len(keys) > 0 && keyRanges != nil {
-		for _, k := range keys {
-			if rng, ok := keyRanges[k]; ok {
-				if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
-					v.rebuildViewLinesForKeysLocked(keys)
-					break
-				}
+	v.searchQuery = query
+	v.searchQueryLower = asciiLowerBytes([]byte(query))
+	for _, k := range keys {
+		if rng, ok := keyRanges[k]; ok {
+			if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
+				v.rebuildViewLinesForKeysLocked(keys)
+				break
 			}
 		}
 	}
+	queryLower := append([]byte(nil), v.searchQueryLower...)
 	v.mu.Unlock()
 
-	if lower == "" || len(fullLines) == 0 {
+	if len(queryLower) == 0 {
 		fyne.Do(func() {
 			if seq != atomic.LoadUint64(&v.searchSeq) {
 				return
 			}
 			v.mu.Lock()
-			v.searchQuery = query
 			v.highlights = nil
 			v.matchLines = nil
 			v.searchMatchSet = nil
@@ -1437,15 +1438,16 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 		candidates = unionCandidateLines(index, keys)
 	}
 
-	go func(seq uint64, lower string, candidates []int, lowerLines, fullLines []string) {
+	go func(seq uint64, queryLower []byte, candidates []int) {
 		matchLines := make([]int, 0)
 		matchSet := make(map[int]struct{})
 
 		for _, i := range candidates {
-			if i < 0 || i >= len(fullLines) || i >= len(lowerLines) {
+			lineBytes := v.fullLineBytes(i)
+			if len(lineBytes) == 0 {
 				continue
 			}
-			if !strings.Contains(lowerLines[i], lower) {
+			if !containsFoldASCII(lineBytes, queryLower) {
 				continue
 			}
 			matchSet[i] = struct{}{}
@@ -1457,7 +1459,6 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 				return
 			}
 			v.mu.Lock()
-			v.searchQuery = query
 			v.matchLines = matchLines
 			v.searchMatchSet = matchSet
 			if v.searchStructural {
@@ -1482,7 +1483,7 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 				v.setGrid(nil, nil)
 			}
 		})
-	}(seq, lower, candidates, lowerLines, fullLines)
+	}(seq, queryLower, candidates)
 }
 
 func (v *JSONMarkdownView) applySearch(q string) {
@@ -1592,7 +1593,7 @@ func (v *JSONMarkdownView) scrollToRow(row int) {
 func (v *JSONMarkdownView) rebuildViewLinesForMatchesLocked(matchSet map[int]struct{}) {
 	v.viewLines = v.viewLines[:0]
 	v.lineMap = v.lineMap[:0]
-	if len(v.fullLines) == 0 || len(matchSet) == 0 {
+	if v.fullLineCountLocked() == 0 || len(matchSet) == 0 {
 		return
 	}
 
@@ -1645,12 +1646,13 @@ func (v *JSONMarkdownView) rebuildViewLinesForMatchesLocked(matchSet map[int]str
 			keepLines[end] = struct{}{}
 		}
 		prev := s - 1
-		if prev >= 0 && allowed(prev) && isKeyLineWithoutBrace(v.fullLines[prev]) {
+		if prev >= 0 && allowed(prev) && isKeyLineWithoutBrace(v.fullLineLocked(prev)) {
 			keepLines[prev] = struct{}{}
 		}
 	}
 
-	for i := 0; i < len(v.fullLines); {
+	lineCount := v.fullLineCountLocked()
+	for i := 0; i < lineCount; {
 		if !allowed(i) {
 			i++
 			continue
@@ -1662,7 +1664,7 @@ func (v *JSONMarkdownView) rebuildViewLinesForMatchesLocked(matchSet map[int]str
 			}
 		}
 		if _, ok := keepLines[i]; ok {
-			v.viewLines = append(v.viewLines, v.fullLines[i])
+			v.viewLines = append(v.viewLines, v.fullLineLocked(i))
 			v.lineMap = append(v.lineMap, i)
 		}
 		i++
@@ -1788,9 +1790,8 @@ func collectTopLevelKeys(v any) []string {
 	return keys
 }
 
-func buildSearchIndex(lines []string, foldRanges map[int]int) (map[string][]int, []string, map[string]keyRange, []int, map[string]int) {
+func buildSearchIndex(lines []string, foldRanges map[int]int) (map[string][]int, map[string]keyRange, []int, map[string]int) {
 	index := make(map[string][]int)
-	lower := make([]string, len(lines))
 	keyStarts := make(map[string]int)
 	keyOrder := make([]int, 0)
 	keyRanges := make(map[string]keyRange)
@@ -1798,7 +1799,6 @@ func buildSearchIndex(lines []string, foldRanges map[int]int) (map[string][]int,
 	allLines := make([]int, 0, len(lines))
 
 	for i, line := range lines {
-		lower[i] = strings.ToLower(line)
 		allLines = append(allLines, i)
 		if lineIndentDepth(line) != 1 {
 			continue
@@ -1849,7 +1849,7 @@ func buildSearchIndex(lines []string, foldRanges map[int]int) (map[string][]int,
 			index[key] = append(index[key], i)
 		}
 	}
-	return index, lower, keyRanges, allLines, keyFold
+	return index, keyRanges, allLines, keyFold
 }
 
 func lineIndentDepth(line string) int {
@@ -1867,14 +1867,17 @@ func buildVisibleHighlights(lines []string, lineMap []int, query string, matchSe
 	if query == "" || len(lines) == 0 || len(lineMap) == 0 || matchSet == nil {
 		return nil
 	}
-	lower := strings.ToLower(query)
+	queryLower := asciiLowerBytes([]byte(query))
+	if len(queryLower) == 0 {
+		return nil
+	}
 	highlights := make(map[int][]highlightRange)
 	for i := 0; i < len(lines) && i < len(lineMap); i++ {
 		srcLine := lineMap[i]
 		if _, ok := matchSet[srcLine]; !ok {
 			continue
 		}
-		ranges := findHighlightRanges(lines[i], lower)
+		ranges := findHighlightRangesASCII(lines[i], queryLower)
 		if len(ranges) == 0 {
 			continue
 		}
@@ -1883,30 +1886,222 @@ func buildVisibleHighlights(lines []string, lineMap []int, query string, matchSe
 	return highlights
 }
 
-func findHighlightRanges(line string, query string) []highlightRange {
-	if query == "" || line == "" {
+func findHighlightRangesASCII(line string, queryLower []byte) []highlightRange {
+	if line == "" || len(queryLower) == 0 {
 		return nil
 	}
-	lineRunes := []rune(strings.ToLower(line))
-	queryRunes := []rune(strings.ToLower(query))
-	if len(queryRunes) == 0 || len(queryRunes) > len(lineRunes) {
-		return nil
-	}
+	lineBytes := []byte(line)
 	var ranges []highlightRange
-	for i := 0; i+len(queryRunes) <= len(lineRunes); i++ {
+	start := 0
+	for {
+		idx := indexFoldASCII(lineBytes[start:], queryLower)
+		if idx < 0 {
+			break
+		}
+		from := start + idx
+		to := from + len(queryLower)
+		ranges = append(ranges, highlightRange{start: from, end: to})
+		start = to
+		if start >= len(lineBytes) {
+			break
+		}
+	}
+	return ranges
+}
+
+func (v *JSONMarkdownView) fullLineBytes(i int) []byte {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
+		return v.fullBuf.Line(i)
+	}
+	if i < 0 || i >= len(v.fullLines) {
+		return nil
+	}
+	return []byte(v.fullLines[i])
+}
+
+func asciiLowerBytes(in []byte) []byte {
+	out := make([]byte, len(in))
+	for i, b := range in {
+		if b >= 'A' && b <= 'Z' {
+			out[i] = b + ('a' - 'A')
+			continue
+		}
+		out[i] = b
+	}
+	return out
+}
+
+func indexFoldASCII(haystack []byte, needleLower []byte) int {
+	if len(needleLower) == 0 {
+		return 0
+	}
+	if len(needleLower) > len(haystack) {
+		return -1
+	}
+	limit := len(haystack) - len(needleLower)
+	for i := 0; i <= limit; i++ {
 		match := true
-		for j := range queryRunes {
-			if lineRunes[i+j] != queryRunes[j] {
+		for j := 0; j < len(needleLower); j++ {
+			b := haystack[i+j]
+			if b >= 'A' && b <= 'Z' {
+				b += 'a' - 'A'
+			}
+			if b != needleLower[j] {
 				match = false
 				break
 			}
 		}
 		if match {
-			ranges = append(ranges, highlightRange{start: i, end: i + len(queryRunes)})
-			i += len(queryRunes) - 1
+			return i
 		}
 	}
-	return ranges
+	return -1
+}
+
+func containsFoldASCII(haystack []byte, needleLower []byte) bool {
+	return indexFoldASCII(haystack, needleLower) >= 0
+}
+
+// JSONBuffer stores JSON as bytes with line start offsets for zero-copy access.
+type JSONBuffer struct {
+	data        []byte
+	lineOffsets []int
+}
+
+func newJSONBuffer(s string) *JSONBuffer {
+	b := &JSONBuffer{}
+	if s == "" {
+		return b
+	}
+	b.data = []byte(s)
+	b.lineOffsets = buildLineOffsets(b.data)
+	return b
+}
+
+func buildLineOffsets(data []byte) []int {
+	if len(data) == 0 {
+		return nil
+	}
+	offsets := make([]int, 0, 1024)
+	offsets = append(offsets, 0)
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\n' {
+			offsets = append(offsets, i+1)
+		}
+	}
+	return offsets
+}
+
+func (b *JSONBuffer) LineCount() int {
+	if b == nil {
+		return 0
+	}
+	return len(b.lineOffsets)
+}
+
+func (b *JSONBuffer) Line(i int) []byte {
+	if b == nil || i < 0 || i >= len(b.lineOffsets) {
+		return nil
+	}
+	start := b.lineOffsets[i]
+	if start >= len(b.data) {
+		return nil
+	}
+	end := len(b.data)
+	if i+1 < len(b.lineOffsets) {
+		end = b.lineOffsets[i+1] - 1
+		if end < start {
+			end = start
+		}
+	}
+	if end > len(b.data) {
+		end = len(b.data)
+	}
+	return b.data[start:end]
+}
+
+func (b *JSONBuffer) LineString(i int) string {
+	return string(b.Line(i))
+}
+
+func splitLinesFromBuffer(b *JSONBuffer) []string {
+	if b == nil || b.LineCount() == 0 {
+		return nil
+	}
+	lines := make([]string, 0, b.LineCount())
+	for i := 0; i < b.LineCount(); i++ {
+		lines = append(lines, b.LineString(i))
+	}
+	return lines
+}
+
+func (v *JSONMarkdownView) fullLineCountLocked() int {
+	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
+		return v.fullBuf.LineCount()
+	}
+	return len(v.fullLines)
+}
+
+func (v *JSONMarkdownView) fullLineLocked(i int) string {
+	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
+		return v.fullBuf.LineString(i)
+	}
+	if i < 0 || i >= len(v.fullLines) {
+		return ""
+	}
+	return v.fullLines[i]
+}
+
+func wrapCopyContent(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return s
+	}
+	if strings.Contains(trimmed, "\n") {
+		return "{\n" + trimmed + "\n}"
+	}
+	return "{" + trimmed + "}"
+}
+
+func normalizeKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+func unionCandidateLines(index map[string][]int, keys []string) []int {
+	if len(keys) == 0 || index == nil {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	out := make([]int, 0)
+	for _, k := range keys {
+		for _, ln := range index[k] {
+			if _, ok := seen[ln]; ok {
+				continue
+			}
+			seen[ln] = struct{}{}
+			out = append(out, ln)
+		}
+	}
+	sort.Ints(out)
+	return out
 }
 
 func buildFoldRangesWithDepth(lines []string) (map[int]int, map[int]int) {
@@ -2045,34 +2240,6 @@ func isDarkColor(c color.Color) bool {
 	return lum < 0.5
 }
 
-func (v *JSONMarkdownView) SelectedKeyValueString() string {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.selectedValueLine >= 0 {
-		if val, ok := v.fullValueForLineLocked(v.selectedValueLine); ok {
-			return wrapCopyContent(strings.TrimSpace(val))
-		}
-	}
-	if strings.TrimSpace(v.selectedValueText) != "" {
-		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
-	}
-	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
-}
-
-func quoteKeyIfNeeded(key string) string {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return ""
-	}
-	// If already quoted (rare), keep as-is.
-	if strings.HasPrefix(key, "\"") && strings.HasSuffix(key, "\"") {
-		return key
-	}
-	return "\"" + key + "\""
-}
-
-// --- end JSON color palette
-
 func (v *JSONMarkdownView) fullValueForLine(srcLine int) (string, bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -2080,10 +2247,10 @@ func (v *JSONMarkdownView) fullValueForLine(srcLine int) (string, bool) {
 }
 
 func (v *JSONMarkdownView) fullValueForLineLocked(srcLine int) (string, bool) {
-	if srcLine < 0 || srcLine >= len(v.fullLines) {
+	if srcLine < 0 || srcLine >= v.fullLineCountLocked() {
 		return "", false
 	}
-	line := v.fullLines[srcLine]
+	line := v.fullLineLocked(srcLine)
 	val, rng, ok := findValueRange(line)
 	if !ok {
 		return "", false
@@ -2104,8 +2271,8 @@ func (v *JSONMarkdownView) fullValueForLineLocked(srcLine int) (string, bool) {
 	esc := false
 	out := make([]string, 0, 16)
 
-	for i := srcLine; i < len(v.fullLines); i++ {
-		ln := v.fullLines[i]
+	for i := srcLine; i < v.fullLineCountLocked(); i++ {
+		ln := v.fullLineLocked(i)
 		runes := []rune(ln)
 		startCol := 0
 		if i == srcLine {
@@ -2157,52 +2324,27 @@ func (v *JSONMarkdownView) fullValueForLineLocked(srcLine int) (string, bool) {
 	return "", false
 }
 
-func wrapCopyContent(s string) string {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return s
+func quoteKeyIfNeeded(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
 	}
-	if strings.Contains(trimmed, "\n") {
-		return "{\n" + trimmed + "\n}"
+	if strings.HasPrefix(key, "\"") && strings.HasSuffix(key, "\"") {
+		return key
 	}
-	return "{" + trimmed + "}"
+	return "\"" + key + "\""
 }
 
-func normalizeKeys(keys []string) []string {
-	if len(keys) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(keys))
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			continue
-		}
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
-		out = append(out, k)
-	}
-	return out
-}
-
-func unionCandidateLines(index map[string][]int, keys []string) []int {
-	if len(keys) == 0 || index == nil {
-		return nil
-	}
-	seen := make(map[int]struct{})
-	out := make([]int, 0)
-	for _, k := range keys {
-		for _, ln := range index[k] {
-			if _, ok := seen[ln]; ok {
-				continue
-			}
-			seen[ln] = struct{}{}
-			out = append(out, ln)
+func (v *JSONMarkdownView) SelectedKeyValueString() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.selectedValueLine >= 0 {
+		if val, ok := v.fullValueForLineLocked(v.selectedValueLine); ok {
+			return wrapCopyContent(strings.TrimSpace(val))
 		}
 	}
-	sort.Ints(out)
-	return out
+	if strings.TrimSpace(v.selectedValueText) != "" {
+		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
+	}
+	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
 }
