@@ -36,6 +36,53 @@ const prefLastProtoRoot = "lastProtoRoot"
 const prefPresetIndex = "preset.index"
 const prefPresetPrefix = "preset."
 
+// overlayLayout positions the second object in the top-right corner without covering the whole area.
+type overlayLayout struct{}
+
+func (overlayLayout) Layout(objects []fyne.CanvasObject, size fyne.Size) {
+	if len(objects) == 0 {
+		return
+	}
+	base := objects[0]
+	base.Resize(size)
+	base.Move(fyne.NewPos(0, 0))
+
+	if len(objects) < 2 {
+		return
+	}
+	overlay := objects[1]
+	pad := theme.Padding()
+	os := overlay.MinSize()
+	x := size.Width - os.Width - pad
+	if x < 0 {
+		x = 0
+	}
+	y := pad
+	overlay.Move(fyne.NewPos(x, y))
+	overlay.Resize(os)
+}
+
+func (overlayLayout) MinSize(objects []fyne.CanvasObject) fyne.Size {
+	if len(objects) == 0 {
+		return fyne.NewSize(0, 0)
+	}
+	base := objects[0].MinSize()
+	if len(objects) < 2 {
+		return base
+	}
+	overlay := objects[1].MinSize()
+	pad := theme.Padding() * 2
+	w := base.Width
+	if overlay.Width+pad > w {
+		w = overlay.Width + pad
+	}
+	h := base.Height
+	if overlay.Height+pad > h {
+		h = overlay.Height + pad
+	}
+	return fyne.NewSize(w, h)
+}
+
 func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	dec := deps.Decoder
 	dc := deps.Cache
@@ -100,6 +147,20 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 	}
 
+	revealFile := func(p string) error {
+		if p == "" {
+			return fmt.Errorf("empty path")
+		}
+		switch runtime.GOOS {
+		case "darwin":
+			return exec.Command("open", "-R", p).Start()
+		case "windows":
+			return exec.Command("explorer", "/select,", p).Start()
+		default:
+			return openFolder(p)
+		}
+	}
+
 	// Keep full outputs in memory (UI shows preview for large payloads).
 	var fullJSON string
 
@@ -107,25 +168,30 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	jsonTree := jsontree.NewSearchableJSONTree()
 	jsonMarkdown := jsonmarkdown.NewJSONMarkdownView()
 
-	outTree := jsonTree.View()
+	_ = jsonTree.View()
 	outMarkdown := jsonMarkdown.View()
-	searchWrap := jsonTree.SearchBar()
+	_ = jsonTree.SearchBar()
+	searchJSONWrap := jsonMarkdown.SearchBar()
 
 	// Let header decide width; keep same behavior as before.
 	jsonTree.SetSearchWidth(420)
+	jsonMarkdown.SetSearchWidth(420)
 
 	var resultPanel *fyne.Container
 	var isOutputExpanded bool
 	var savedSize fyne.Size // размер окна до expand
 
 	outputTabs := container.NewAppTabs(
-		container.NewTabItem("Tree", container.NewBorder(container.NewHBox(layout.NewSpacer(), searchWrap), nil, nil, nil, outTree)),
-		container.NewTabItem("JSON", outMarkdown),
+		container.NewTabItem("JSON", container.New(overlayLayout{}, outMarkdown, searchJSONWrap)),
 	)
 	outputTabs.SetTabLocation(container.TabLocationTop)
 
 	isTreeTab := func() bool {
-		return outputTabs.SelectedIndex() == 0
+		return false
+	}
+
+	isJSONTab := func() bool {
+		return true
 	}
 
 	setSearchVisible := func(show bool) {
@@ -141,6 +207,19 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 	}
 
+	setJSONSearchVisible := func(show bool) {
+		if show && !isJSONTab() {
+			return
+		}
+		jsonMarkdown.SetSearchVisible(show)
+		if resultPanel != nil {
+			resultPanel.Refresh()
+		}
+		if show {
+			w.Canvas().Focus(jsonMarkdown.SearchEntry())
+		}
+	}
+
 	var loadPresetDialog dialog.Dialog
 	closeLoadPresetDialog := func() {
 		if loadPresetDialog != nil {
@@ -150,6 +229,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	}
 
 	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
+	registerSearchShortcuts(w.Canvas(), setJSONSearchVisible, func() bool { return jsonMarkdown.SearchVisible() })
 	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
 		if loadPresetDialog != nil {
 			closeLoadPresetDialog()
@@ -166,6 +246,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		w.Clipboard().SetContent(v)
 	})
 	setSearchVisible(false)
+	setJSONSearchVisible(false)
 
 	// Remember the initial window width so auto-resize never inflates it.
 	var initialWidth float32
@@ -205,21 +286,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			s = strings.TrimPrefix(s, "file://")
 		}
 		return s
-	}
-
-	// Try to reveal a file in OS file manager (select the file).
-	revealFile := func(p string) error {
-		if p == "" {
-			return fmt.Errorf("empty path")
-		}
-		switch runtime.GOOS {
-		case "darwin":
-			return exec.Command("open", "-R", p).Start()
-		case "windows":
-			return exec.Command("explorer", "/select,", p).Start()
-		default:
-			return openFolder(p)
-		}
 	}
 
 	// ---- Global settings (shared)
@@ -1002,6 +1068,9 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		if !isTreeTab() {
 			setSearchVisible(false)
 		}
+		if !isJSONTab() {
+			setJSONSearchVisible(false)
+		}
 	}
 
 	// Layout: keep outputStack in a single container to avoid reparenting issues.
@@ -1015,6 +1084,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		if isOutputExpanded {
 			savedSize = w.Canvas().Size()
 			setSearchVisible(false)
+			setJSONSearchVisible(false)
 			btnToggleOutput.Hide()
 			btnCollapse.Show()
 			globalBar.Hide()
