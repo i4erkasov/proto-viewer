@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
@@ -24,22 +25,29 @@ const (
 
 // JSONMarkdownView renders JSON as markdown with lazy line loading.
 type JSONMarkdownView struct {
-	mu      sync.Mutex
-	lines   []string
-	loaded  int
-	chunk   int
-	loading bool
+	mu        sync.Mutex
+	fullLines []string
+	viewLines []string
+	lineMap   []int
+	loaded    int
+	chunk     int
+	loading   bool
 
-	tgrid  *widget.TextGrid
-	scroll *container.Scroll
+	foldRanges map[int]int
+	folded     map[int]bool
+
+	tgrid   *widget.TextGrid
+	overlay *tapOverlay
+	scroll  *container.Scroll
 }
 
 // NewJSONMarkdownView creates a markdown view with lazy loading.
 func NewJSONMarkdownView() *JSONMarkdownView {
 	v := &JSONMarkdownView{chunk: defaultChunkLines}
 	v.tgrid = widget.NewTextGrid()
+	v.overlay = newTapOverlay(v.handleTap)
 	// styles applied per cell
-	v.scroll = container.NewScroll(v.tgrid)
+	v.scroll = container.NewScroll(container.NewMax(v.tgrid, v.overlay))
 	v.scroll.OnScrolled = func(_ fyne.Position) {
 		v.tryLoadMore()
 	}
@@ -56,6 +64,7 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.mu.Lock()
 	v.loaded = 0
 	v.loading = false
+	v.folded = map[int]bool{}
 	v.mu.Unlock()
 
 	if strings.TrimSpace(s) == "" {
@@ -84,8 +93,19 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 		}
 	}
 
+	lines := splitLines(pretty)
+	foldRanges, foldDepths := buildFoldRangesWithDepth(lines)
+
 	v.mu.Lock()
-	v.lines = splitLines(pretty)
+	v.fullLines = lines
+	v.foldRanges = foldRanges
+	v.folded = make(map[int]bool, len(foldRanges))
+	for start := range foldRanges {
+		if foldDepths[start] > 0 {
+			v.folded[start] = true
+		}
+	}
+	v.rebuildViewLinesLocked()
 	v.mu.Unlock()
 
 	v.loadMore()
@@ -117,21 +137,21 @@ func (v *JSONMarkdownView) tryLoadMore() {
 
 func (v *JSONMarkdownView) loadMore() {
 	v.mu.Lock()
-	if len(v.lines) == 0 {
+	if len(v.viewLines) == 0 {
 		v.mu.Unlock()
 		v.setGrid(nil)
 		return
 	}
-	if v.loaded >= len(v.lines) {
+	if v.loaded >= len(v.viewLines) {
 		v.mu.Unlock()
 		return
 	}
 	end := v.loaded + v.chunk
-	if end > len(v.lines) {
-		end = len(v.lines)
+	if end > len(v.viewLines) {
+		end = len(v.viewLines)
 	}
 	chunkLines := make([]string, end)
-	copy(chunkLines, v.lines[:end])
+	copy(chunkLines, v.viewLines[:end])
 	v.loaded = end
 	v.mu.Unlock()
 
@@ -366,4 +386,211 @@ func buildTextGridCells(line string) []widget.TextGridCell {
 	}
 	flush()
 	return cells
+}
+
+// tapOverlay captures clicks over the TextGrid to toggle folds.
+type tapOverlay struct {
+	widget.BaseWidget
+	onTap func(pos fyne.Position)
+}
+
+func newTapOverlay(onTap func(pos fyne.Position)) *tapOverlay {
+	o := &tapOverlay{onTap: onTap}
+	o.ExtendBaseWidget(o)
+	return o
+}
+
+func (o *tapOverlay) Tapped(ev *fyne.PointEvent) {
+	if o.onTap != nil {
+		o.onTap(ev.Position)
+	}
+}
+
+func (o *tapOverlay) CreateRenderer() fyne.WidgetRenderer {
+	rect := canvas.NewRectangle(color.Transparent)
+	return widget.NewSimpleRenderer(rect)
+}
+
+func (v *JSONMarkdownView) rebuildViewLinesLocked() {
+	v.viewLines = v.viewLines[:0]
+	v.lineMap = v.lineMap[:0]
+	if len(v.fullLines) == 0 {
+		return
+	}
+	for i := 0; i < len(v.fullLines); {
+		if end, ok := v.foldRanges[i]; ok && end > i && v.folded[i] {
+			v.viewLines = append(v.viewLines, buildFoldPlaceholder(v.fullLines[i]))
+			v.lineMap = append(v.lineMap, i)
+			i = end + 1
+			continue
+		}
+		v.viewLines = append(v.viewLines, v.fullLines[i])
+		v.lineMap = append(v.lineMap, i)
+		i++
+	}
+}
+
+func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
+	if v.tgrid == nil {
+		return
+	}
+	row, _ := v.tgrid.CursorLocationForPosition(pos)
+	if row < 0 {
+		return
+	}
+
+	v.mu.Lock()
+	if row >= len(v.lineMap) {
+		v.mu.Unlock()
+		return
+	}
+	srcLine := v.lineMap[row]
+	end, ok := v.foldRanges[srcLine]
+	if !ok || end <= srcLine {
+		v.mu.Unlock()
+		return
+	}
+	v.folded[srcLine] = !v.folded[srcLine]
+	v.rebuildViewLinesLocked()
+	if v.loaded > len(v.viewLines) {
+		v.loaded = len(v.viewLines)
+	}
+	if v.loaded == 0 && len(v.viewLines) > 0 {
+		v.loaded = minInt(v.chunk, len(v.viewLines))
+	}
+	if !v.folded[srcLine] {
+		if newRow := findViewRow(v.lineMap, srcLine); newRow >= 0 {
+			target := newRow + 1 + v.chunk
+			if target > v.loaded {
+				v.loaded = minInt(target, len(v.viewLines))
+			}
+		}
+	}
+	lines := v.viewLines
+	loaded := v.loaded
+	offset := v.scroll.Offset
+	v.mu.Unlock()
+
+	v.setGrid(lines[:loaded])
+	fyne.Do(func() {
+		if v.scroll != nil {
+			v.scroll.ScrollToOffset(offset)
+		}
+	})
+}
+
+func findViewRow(lineMap []int, srcLine int) int {
+	for i, v := range lineMap {
+		if v == srcLine {
+			return i
+		}
+	}
+	return -1
+}
+
+func buildFoldRangesWithDepth(lines []string) (map[int]int, map[int]int) {
+	ranges := map[int]int{}
+	depths := map[int]int{}
+	type entry struct {
+		line  int
+		brace rune
+		depth int
+	}
+	stack := make([]entry, 0, 32)
+	depth := 0
+
+	for i, line := range lines {
+		inString := false
+		esc := false
+		for _, r := range line {
+			if inString {
+				if esc {
+					esc = false
+					continue
+				}
+				if r == '\\' {
+					esc = true
+					continue
+				}
+				if r == '"' {
+					inString = false
+				}
+				continue
+			}
+			if r == '"' {
+				inString = true
+				continue
+			}
+			switch r {
+			case '{', '[':
+				stack = append(stack, entry{line: i, brace: r, depth: depth})
+				depth++
+			case '}', ']':
+				if len(stack) == 0 {
+					continue
+				}
+				depth--
+				open := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				if open.line < i {
+					ranges[open.line] = i
+					depths[open.line] = open.depth
+				}
+			}
+		}
+	}
+	return ranges, depths
+}
+
+func buildFoldRanges(lines []string) map[int]int {
+	ranges, _ := buildFoldRangesWithDepth(lines)
+	return ranges
+}
+
+func buildFoldPlaceholder(line string) string {
+	idx, brace := findFoldToken(line)
+	if idx == -1 {
+		return line
+	}
+	prefix := line[:idx]
+	if brace == '[' {
+		return prefix + "[ ... ]"
+	}
+	return prefix + "{ ... }"
+}
+
+func findFoldToken(line string) (int, rune) {
+	inString := false
+	esc := false
+	for i, r := range line {
+		if inString {
+			if esc {
+				esc = false
+				continue
+			}
+			if r == '\\' {
+				esc = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		if r == '"' {
+			inString = true
+			continue
+		}
+		if r == '{' || r == '[' {
+			return i, r
+		}
+	}
+	return -1, 0
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
