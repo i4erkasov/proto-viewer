@@ -83,6 +83,10 @@ type JSONMarkdownView struct {
 	searchSeq        uint64
 	searchMatchSet   map[int]struct{}
 	searchQueryLower []byte
+	trigramIndex     map[[3]byte][]int32
+	trigramEnabled   bool
+	trigramCapBytes  int
+	trigramUsedBytes int
 	lineNumWidth     int
 	debounceMu       sync.Mutex
 	debounceTimer    *time.Timer
@@ -321,6 +325,10 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchKeyFold = nil
 	v.searchMatchSet = nil
 	v.searchQueryLower = nil
+	v.trigramIndex = nil
+	v.trigramEnabled = false
+	v.trigramCapBytes = 0
+	v.trigramUsedBytes = 0
 	v.lineNumWidth = 0
 	v.selectedKeyLine = -1
 	v.selectedKeyRange = highlightRange{}
@@ -382,6 +390,7 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchKeyRanges = keyRanges
 	v.searchKeyFold = keyFold
 	v.lineNumWidth = lineNumWidth
+	v.buildTrigramIndexLocked(lines, len(pretty))
 	v.rebuildViewLinesLocked()
 	v.mu.Unlock()
 
@@ -1394,6 +1403,8 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	index := v.searchKeyIndex
 	allLines := v.searchAll
 	keyRanges := v.searchKeyRanges
+	trigramEnabled := v.trigramEnabled
+	trigramIndex := v.trigramIndex
 	v.searchQuery = query
 	v.searchQueryLower = asciiLowerBytes([]byte(query))
 	for _, k := range keys {
@@ -1436,6 +1447,13 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 		candidates = allLines
 	} else {
 		candidates = unionCandidateLines(index, keys)
+	}
+
+	if trigramEnabled && trigramIndex != nil && len(queryLower) >= 3 {
+		triCandidates := trigramCandidatesFromIndex(trigramIndex, queryLower)
+		if triCandidates != nil {
+			candidates = intersectSortedInts(candidates, triCandidates)
+		}
 	}
 
 	go func(seq uint64, queryLower []byte, candidates []int) {
@@ -2347,4 +2365,173 @@ func (v *JSONMarkdownView) SelectedKeyValueString() string {
 		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
 	}
 	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
+}
+
+func (v *JSONMarkdownView) buildTrigramIndexLocked(lines []string, dataSize int) {
+	v.trigramIndex = nil
+	v.trigramEnabled = false
+	v.trigramUsedBytes = 0
+	v.trigramCapBytes = trigramCapBytes(dataSize)
+	if v.trigramCapBytes <= 0 || len(lines) == 0 {
+		return
+	}
+
+	idx := make(map[[3]byte][]int32)
+	used := 0
+	capBytes := v.trigramCapBytes
+
+	for lineIdx, line := range lines {
+		if len(line) < 3 {
+			continue
+		}
+		var seen map[[3]byte]struct{}
+		if len(line) > 64 {
+			seen = make(map[[3]byte]struct{}, 16)
+		}
+		for i := 0; i+2 < len(line); i++ {
+			b0 := toLowerASCII(line[i])
+			b1 := toLowerASCII(line[i+1])
+			b2 := toLowerASCII(line[i+2])
+			tri := [3]byte{b0, b1, b2}
+			if seen != nil {
+				if _, ok := seen[tri]; ok {
+					continue
+				}
+				seen[tri] = struct{}{}
+			}
+			lst, ok := idx[tri]
+			if !ok {
+				lst = make([]int32, 0, 4)
+				idx[tri] = lst
+				used += 24
+			}
+			idx[tri] = append(lst, int32(lineIdx))
+			used += 4
+			if used > capBytes {
+				v.trigramIndex = nil
+				v.trigramEnabled = false
+				v.trigramUsedBytes = 0
+				return
+			}
+		}
+	}
+
+	v.trigramIndex = idx
+	v.trigramEnabled = true
+	v.trigramUsedBytes = used
+}
+
+func trigramCapBytes(dataSize int) int {
+	if dataSize <= 0 {
+		return 0
+	}
+	capBytes := dataSize / 10
+	if capBytes < 8<<20 {
+		capBytes = 8 << 20
+	}
+	if capBytes > 64<<20 {
+		capBytes = 64 << 20
+	}
+	return capBytes
+}
+
+func trigramCandidatesFromIndex(idx map[[3]byte][]int32, queryLower []byte) []int {
+	if idx == nil || len(queryLower) < 3 {
+		return nil
+	}
+	trigrams := queryTrigrams(queryLower)
+	if len(trigrams) == 0 {
+		return nil
+	}
+	lists := make([][]int32, 0, len(trigrams))
+	for _, tri := range trigrams {
+		lst, ok := idx[tri]
+		if !ok || len(lst) == 0 {
+			return []int{}
+		}
+		lists = append(lists, lst)
+	}
+	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
+	base := append([]int32(nil), lists[0]...)
+	for i := 1; i < len(lists); i++ {
+		base = intersectSortedInt32(base, lists[i])
+		if len(base) == 0 {
+			return []int{}
+		}
+	}
+	out := make([]int, len(base))
+	for i, v := range base {
+		out[i] = int(v)
+	}
+	return out
+}
+
+func queryTrigrams(queryLower []byte) [][3]byte {
+	if len(queryLower) < 3 {
+		return nil
+	}
+	out := make([][3]byte, 0, len(queryLower)-2)
+	seen := make(map[[3]byte]struct{}, 8)
+	for i := 0; i+2 < len(queryLower); i++ {
+		tri := [3]byte{queryLower[i], queryLower[i+1], queryLower[i+2]}
+		if _, ok := seen[tri]; ok {
+			continue
+		}
+		seen[tri] = struct{}{}
+		out = append(out, tri)
+	}
+	return out
+}
+
+func intersectSortedInt32(a, b []int32) []int32 {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	out := make([]int32, 0, minInt(len(a), len(b)))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		av := a[i]
+		bv := b[j]
+		switch {
+		case av == bv:
+			out = append(out, av)
+			i++
+			j++
+		case av < bv:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+func intersectSortedInts(a, b []int) []int {
+	if len(a) == 0 || len(b) == 0 {
+		return nil
+	}
+	out := make([]int, 0, minInt(len(a), len(b)))
+	i, j := 0, 0
+	for i < len(a) && j < len(b) {
+		av := a[i]
+		bv := b[j]
+		switch {
+		case av == bv:
+			out = append(out, av)
+			i++
+			j++
+		case av < bv:
+			i++
+		default:
+			j++
+		}
+	}
+	return out
+}
+
+func toLowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }
