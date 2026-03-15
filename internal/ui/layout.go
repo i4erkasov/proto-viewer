@@ -16,6 +16,7 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/theme"
@@ -140,7 +141,20 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 	}
 
+	var loadPresetDialog dialog.Dialog
+	closeLoadPresetDialog := func() {
+		if loadPresetDialog != nil {
+			loadPresetDialog.Hide()
+			loadPresetDialog = nil
+		}
+	}
+
 	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
+		if loadPresetDialog != nil {
+			closeLoadPresetDialog()
+		}
+	})
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
 		if !isTreeTab() {
 			return
@@ -362,6 +376,25 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		return p, true
 	}
 
+	deletePreset := func(name string) {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return
+		}
+		prefs.SetString(prefPresetPrefix+name, "")
+		list := loadPresetIndex()
+		if len(list) == 0 {
+			return
+		}
+		out := make([]string, 0, len(list))
+		for _, v := range list {
+			if v != name {
+				out = append(out, v)
+			}
+		}
+		savePresetIndex(out)
+	}
+
 	btnSavePreset := widget.NewButtonWithIcon("Save", theme.DocumentSaveIcon(), func() {
 		root := strings.TrimSpace(protoRoot.Text)
 		pfile := strings.TrimSpace(protoFile.Text)
@@ -397,35 +430,68 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return
 		}
 		sel := searchselect.NewSearchableSelect(w, "Search preset…", list)
-		dlg := dialog.NewCustomConfirm(
-			"Load preset",
-			"Load",
-			"Cancel",
+
+		btnDelete := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
+			name := strings.TrimSpace(sel.Selected())
+			if name == "" {
+				return
+			}
+			dialog.ShowConfirm("Delete preset", "Delete preset '"+name+"'?", func(ok bool) {
+				if !ok {
+					return
+				}
+				deletePreset(name)
+				updated := loadPresetIndex()
+				sel.SetOptions(updated)
+				sel.SetSelected("")
+				sel.Refresh()
+				if len(updated) == 0 {
+					closeLoadPresetDialog()
+				}
+			}, w)
+		})
+		btnDelete.Importance = widget.LowImportance
+
+		btnLoad := widget.NewButtonWithIcon("Load", theme.DownloadIcon(), func() {
+			name := strings.TrimSpace(sel.Selected())
+			if name == "" {
+				return
+			}
+			p, ok := loadPreset(name)
+			if !ok {
+				dialog.ShowError(fmt.Errorf("failed to load preset"), w)
+				return
+			}
+			protoRoot.SetText(p.ProtoRoot)
+			protoFile.SetText(p.ProtoFile)
+			typeSelect.SetSelected(p.MessageType)
+			closeLoadPresetDialog()
+		})
+		btnLoad.Importance = widget.HighImportance
+
+		btnCancel := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
+			closeLoadPresetDialog()
+		})
+		btnCancel.Importance = widget.LowImportance
+
+		selectRow := container.NewBorder(nil, nil, nil, btnDelete, sel)
+		btnGap := container.NewGridWrap(fyne.NewSize(12, btnLoad.MinSize().Height), layout.NewSpacer())
+		btnRow := container.NewHBox(layout.NewSpacer(), btnCancel, btnGap, btnLoad)
+
+		content := container.NewBorder(
+			nil,
+			btnRow,
+			nil,
+			nil,
 			container.NewVBox(
 				widget.NewLabel("Select a saved preset:"),
-				sel,
+				selectRow,
+				widget.NewSeparator(),
 			),
-			func(ok bool) {
-				if !ok {
-					return
-				}
-				name := strings.TrimSpace(sel.Selected())
-				if name == "" {
-					return
-				}
-				p, ok := loadPreset(name)
-				if !ok {
-					dialog.ShowError(fmt.Errorf("failed to load preset"), w)
-					return
-				}
-				protoRoot.SetText(p.ProtoRoot)
-				protoFile.SetText(p.ProtoFile)
-				typeSelect.SetSelected(p.MessageType)
-			},
-			w,
 		)
-		dlg.Resize(fyne.NewSize(520, 240))
-		dlg.Show()
+		loadPresetDialog = dialog.NewCustomWithoutButtons("Load preset", content, w)
+		loadPresetDialog.Resize(fyne.NewSize(560, 260))
+		loadPresetDialog.Show()
 	})
 
 	lblProtoRoot := widget.NewLabel("Proto root:")
@@ -562,7 +628,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	)
 
 	globalBar := container.NewVBox(
-		widget.NewLabel("Proto settings"),
 		protoRootRow,
 		protoFileRow,
 		msgTypeRow,
