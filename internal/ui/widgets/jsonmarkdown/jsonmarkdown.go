@@ -804,7 +804,7 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 	if v.tgrid == nil {
 		return
 	}
-	row, _ := v.tgrid.CursorLocationForPosition(pos)
+	row, col := v.tgrid.CursorLocationForPosition(pos)
 	if row < 0 {
 		return
 	}
@@ -815,6 +815,25 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 		return
 	}
 	srcLine := v.lineMap[row]
+	lineNumWidth := v.lineNumWidth
+	viewLine := ""
+	if row < len(v.viewLines) {
+		viewLine = v.viewLines[row]
+	}
+	v.mu.Unlock()
+
+	prefixLen := 0
+	if lineNumWidth > 0 {
+		prefixLen = lineNumWidth + 2
+	}
+	if col < prefixLen {
+		return
+	}
+	if !isInteractiveCell(viewLine, col-prefixLen) {
+		return
+	}
+
+	v.mu.Lock()
 	end, ok := v.foldRanges[srcLine]
 	if !ok || end <= srcLine {
 		v.mu.Unlock()
@@ -853,90 +872,52 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 	})
 }
 
-func findViewRow(lineMap []int, srcLine int) int {
-	for i, v := range lineMap {
-		if v == srcLine {
-			return i
-		}
+func isInteractiveCell(line string, col int) bool {
+	if line == "" || col < 0 {
+		return false
 	}
-	return -1
+	if start, end, ok := findTokenRange(line, "{ ... }"); ok {
+		return col >= start && col <= end
+	}
+	if start, end, ok := findTokenRange(line, "[ ... ]"); ok {
+		return col >= start && col <= end
+	}
+	if start, end, ok := findKeyRange(line); ok {
+		return col >= start && col <= end
+	}
+	if idx, ok := singleBraceIndex(line); ok {
+		return col == idx
+	}
+	return false
 }
 
-func buildFoldRangesWithDepth(lines []string) (map[int]int, map[int]int) {
-	ranges := map[int]int{}
-	depths := map[int]int{}
-	type entry struct {
-		line  int
-		brace rune
-		depth int
+func findTokenRange(line, token string) (int, int, bool) {
+	lineRunes := []rune(line)
+	tokenRunes := []rune(token)
+	if len(tokenRunes) == 0 || len(lineRunes) < len(tokenRunes) {
+		return 0, 0, false
 	}
-	stack := make([]entry, 0, 32)
-	depth := 0
-
-	for i, line := range lines {
-		inString := false
-		esc := false
-		for _, r := range line {
-			if inString {
-				if esc {
-					esc = false
-					continue
-				}
-				if r == '\\' {
-					esc = true
-					continue
-				}
-				if r == '"' {
-					inString = false
-				}
-				continue
-			}
-			if r == '"' {
-				inString = true
-				continue
-			}
-			switch r {
-			case '{', '[':
-				stack = append(stack, entry{line: i, brace: r, depth: depth})
-				depth++
-			case '}', ']':
-				if len(stack) == 0 {
-					continue
-				}
-				depth--
-				open := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				if open.line < i {
-					ranges[open.line] = i
-					depths[open.line] = open.depth
-				}
+	for i := 0; i+len(tokenRunes) <= len(lineRunes); i++ {
+		match := true
+		for j := range tokenRunes {
+			if lineRunes[i+j] != tokenRunes[j] {
+				match = false
+				break
 			}
 		}
+		if match {
+			return i, i + len(tokenRunes) - 1, true
+		}
 	}
-	return ranges, depths
+	return 0, 0, false
 }
 
-func buildFoldRanges(lines []string) map[int]int {
-	ranges, _ := buildFoldRangesWithDepth(lines)
-	return ranges
-}
-
-func buildFoldPlaceholder(line string) string {
-	idx, brace := findFoldToken(line)
-	if idx == -1 {
-		return line
-	}
-	prefix := line[:idx]
-	if brace == '[' {
-		return prefix + "[ ... ]"
-	}
-	return prefix + "{ ... }"
-}
-
-func findFoldToken(line string) (int, rune) {
+func findKeyRange(line string) (int, int, bool) {
+	runes := []rune(line)
 	inString := false
 	esc := false
-	for i, r := range line {
+	start := -1
+	for i, r := range runes {
 		if inString {
 			if esc {
 				esc = false
@@ -947,51 +928,38 @@ func findFoldToken(line string) (int, rune) {
 				continue
 			}
 			if r == '"' {
+				j := i + 1
+				for j < len(runes) && unicode.IsSpace(runes[j]) {
+					j++
+				}
+				if j < len(runes) && runes[j] == ':' {
+					return start, i, true
+				}
 				inString = false
+				continue
 			}
 			continue
 		}
 		if r == '"' {
 			inString = true
+			start = i
+		}
+	}
+	return 0, 0, false
+}
+
+func singleBraceIndex(line string) (int, bool) {
+	runes := []rune(line)
+	for i, r := range runes {
+		if unicode.IsSpace(r) {
 			continue
 		}
 		if r == '{' || r == '[' {
-			return i, r
+			return i, true
 		}
+		return 0, false
 	}
-	return -1, 0
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func highlightColor() color.Color {
-	bg := theme.BackgroundColor()
-	if isDarkColor(bg) {
-		return color.NRGBA{R: 0xFF, G: 0xB3, B: 0x4D, A: 0x7F}
-	}
-	return color.NRGBA{R: 0xFF, G: 0xE0, B: 0x59, A: 0x99}
-}
-
-func lineNumberBgColor() color.Color {
-	bg := theme.BackgroundColor()
-	if isDarkColor(bg) {
-		return color.NRGBA{R: 0x24, G: 0x24, B: 0x24, A: 0xFF}
-	}
-	return color.NRGBA{R: 0xF1, G: 0xF1, B: 0xF1, A: 0xFF}
-}
-
-func isDarkColor(c color.Color) bool {
-	r, g, b, _ := c.RGBA()
-	rl := float64(r) / 65535.0
-	gl := float64(g) / 65535.0
-	bl := float64(b) / 65535.0
-	lum := 0.2126*rl + 0.7152*gl + 0.0722*bl
-	return lum < 0.5
+	return 0, false
 }
 
 // --- end JSON color palette
@@ -1455,4 +1423,140 @@ func findHighlightRanges(line string, query string) []highlightRange {
 		}
 	}
 	return ranges
+}
+
+func buildFoldRangesWithDepth(lines []string) (map[int]int, map[int]int) {
+	ranges := map[int]int{}
+	depths := map[int]int{}
+	type entry struct {
+		line  int
+		brace rune
+		depth int
+	}
+	stack := make([]entry, 0, 32)
+	depth := 0
+
+	for i, line := range lines {
+		inString := false
+		esc := false
+		for _, r := range line {
+			if inString {
+				if esc {
+					esc = false
+					continue
+				}
+				if r == '\\' {
+					esc = true
+					continue
+				}
+				if r == '"' {
+					inString = false
+				}
+				continue
+			}
+			if r == '"' {
+				inString = true
+				continue
+			}
+			switch r {
+			case '{', '[':
+				stack = append(stack, entry{line: i, brace: r, depth: depth})
+				depth++
+			case '}', ']':
+				if len(stack) == 0 {
+					continue
+				}
+				depth--
+				open := stack[len(stack)-1]
+				stack = stack[:len(stack)-1]
+				if open.line < i {
+					ranges[open.line] = i
+					depths[open.line] = open.depth
+				}
+			}
+		}
+	}
+	return ranges, depths
+}
+
+func buildFoldPlaceholder(line string) string {
+	idx, brace := findFoldToken(line)
+	if idx == -1 {
+		return line
+	}
+	prefix := line[:idx]
+	if brace == '[' {
+		return prefix + "[ ... ]"
+	}
+	return prefix + "{ ... }"
+}
+
+func findFoldToken(line string) (int, rune) {
+	inString := false
+	esc := false
+	for i, r := range line {
+		if inString {
+			if esc {
+				esc = false
+				continue
+			}
+			if r == '\\' {
+				esc = true
+				continue
+			}
+			if r == '"' {
+				inString = false
+			}
+			continue
+		}
+		if r == '"' {
+			inString = true
+			continue
+		}
+		if r == '{' || r == '[' {
+			return i, r
+		}
+	}
+	return -1, 0
+}
+
+func findViewRow(lineMap []int, srcLine int) int {
+	for i, v := range lineMap {
+		if v == srcLine {
+			return i
+		}
+	}
+	return -1
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func highlightColor() color.Color {
+	bg := theme.BackgroundColor()
+	if isDarkColor(bg) {
+		return color.NRGBA{R: 0xFF, G: 0xB3, B: 0x4D, A: 0x7F}
+	}
+	return color.NRGBA{R: 0xFF, G: 0xE0, B: 0x59, A: 0x99}
+}
+
+func lineNumberBgColor() color.Color {
+	bg := theme.BackgroundColor()
+	if isDarkColor(bg) {
+		return color.NRGBA{R: 0x24, G: 0x24, B: 0x24, A: 0xFF}
+	}
+	return color.NRGBA{R: 0xF1, G: 0xF1, B: 0xF1, A: 0xFF}
+}
+
+func isDarkColor(c color.Color) bool {
+	r, g, b, _ := c.RGBA()
+	rl := float64(r) / 65535.0
+	gl := float64(g) / 65535.0
+	bl := float64(b) / 65535.0
+	lum := 0.2126*rl + 0.7152*gl + 0.0722*bl
+	return lum < 0.5
 }
