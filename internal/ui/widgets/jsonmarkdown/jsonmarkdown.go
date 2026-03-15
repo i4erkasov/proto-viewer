@@ -48,19 +48,22 @@ type JSONMarkdownView struct {
 	scroll  *container.Scroll
 	win     fyne.Window
 
-	searchEntry     *escEntry
-	searchUp        *widget.Button
-	searchDown      *widget.Button
-	searchUpWrap    *fyne.Container
-	searchDownWrap  *fyne.Container
-	searchNavWrap   *fyne.Container
-	searchEntryWrap *fyne.Container
-	searchWrap      *fyne.Container
-	searchWidth     float32
-	searchQuery     string
-	matchLines      []int
-	matchIndex      int
-	highlights      map[int][]highlightRange
+	searchEntry      *escEntry
+	searchUp         *widget.Button
+	searchDown       *widget.Button
+	searchUpWrap     *fyne.Container
+	searchDownWrap   *fyne.Container
+	searchNavWrap    *fyne.Container
+	searchEntryWrap  *fyne.Container
+	searchWrap       *fyne.Container
+	searchStructChk  *widget.Check
+	searchStructWrap *fyne.Container
+	searchWidth      float32
+	searchQuery      string
+	matchLines       []int
+	matchIndex       int
+	highlights       map[int][]highlightRange
+	searchStructural bool
 
 	selectedKeyLine    int
 	selectedKeyRange   highlightRange
@@ -139,6 +142,13 @@ func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 	v.searchKeySelect.SetSelectedValues(nil)
 	v.searchKeyWidth = 200
 
+	v.searchStructChk = widget.NewCheck("Only matches", func(checked bool) {
+		v.SetSearchStructural(checked)
+	})
+	v.searchStructChk.SetChecked(true)
+	v.searchStructural = true
+	v.searchStructWrap = container.NewGridWrap(v.searchStructChk.MinSize(), v.searchStructChk)
+
 	v.searchUp = widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
 		v.navigateMatch(-1)
 	})
@@ -194,6 +204,21 @@ func (v *JSONMarkdownView) SearchEntry() *widget.Entry {
 	return &v.searchEntry.Entry
 }
 
+// SetSearchStructural toggles structural search mode (show only matched branches).
+func (v *JSONMarkdownView) SetSearchStructural(enabled bool) {
+	v.mu.Lock()
+	v.searchStructural = enabled
+	query := v.searchQuery
+	keys := append([]string(nil), v.searchKeys...)
+	v.mu.Unlock()
+
+	if enabled && strings.TrimSpace(query) != "" {
+		v.applySearchAsync(query)
+		return
+	}
+	v.applyKeyFilterKeys(keys)
+}
+
 // SetSearchWidth sets a fixed width for the search input wrapper.
 func (v *JSONMarkdownView) SetSearchWidth(w float32) {
 	if w <= 0 {
@@ -220,6 +245,9 @@ func (v *JSONMarkdownView) SetSearchWidth(w float32) {
 			keyW = 80
 		}
 	}
+	if entryW < 0 {
+		entryW = minEntryW
+	}
 
 	keyWrap := container.NewGridWrap(
 		fyne.NewSize(keyW, v.searchEntry.MinSize().Height),
@@ -236,12 +264,18 @@ func (v *JSONMarkdownView) SetSearchWidth(w float32) {
 	entryStack := container.NewStack(entryLayer, container.NewBorder(nil, nil, nil, v.searchNavWrap, layout.NewSpacer()))
 	entryWrap := container.NewGridWrap(fyne.NewSize(entryW, entryH), entryStack)
 
-	row := container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
-	row.Resize(fyne.NewSize(w, v.searchEntry.MinSize().Height))
-	row.Refresh()
+	searchRow := container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
+	checkRow := container.NewHBox(layout.NewSpacer(), v.searchStructWrap)
+	rowH := entryH
+	checkH := v.searchStructWrap.MinSize().Height
+	if checkH < rowH {
+		checkH = rowH
+	}
+	searchRow.Resize(fyne.NewSize(w, rowH))
+	checkRow.Resize(fyne.NewSize(w, checkH))
 
-	v.searchWrap.Objects = []fyne.CanvasObject{row}
-	v.searchWrap.Resize(fyne.NewSize(w, v.searchEntry.MinSize().Height))
+	v.searchWrap.Objects = []fyne.CanvasObject{searchRow, checkRow}
+	v.searchWrap.Resize(fyne.NewSize(w, rowH+checkH))
 	v.searchWrap.Refresh()
 }
 
@@ -1419,6 +1453,9 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 			v.searchQuery = query
 			v.matchLines = matchLines
 			v.searchMatchSet = matchSet
+			if v.searchStructural {
+				v.rebuildViewLinesForMatchesLocked(matchSet)
+			}
 			if len(matchLines) == 0 {
 				v.matchIndex = -1
 			} else if v.matchIndex < 0 || v.matchIndex >= len(matchLines) {
@@ -1548,6 +1585,94 @@ func (v *JSONMarkdownView) scrollToRow(row int) {
 	}
 	rowH := v.tgrid.MinSize().Height / float32(rows)
 	v.scroll.ScrollToOffset(fyne.NewPos(0, rowH*float32(row)))
+}
+
+func (v *JSONMarkdownView) rebuildViewLinesForMatchesLocked(matchSet map[int]struct{}) {
+	v.viewLines = v.viewLines[:0]
+	v.lineMap = v.lineMap[:0]
+	if len(v.fullLines) == 0 || len(matchSet) == 0 {
+		return
+	}
+
+	ranges := make([]keyRange, 0, len(v.searchKeys))
+	if len(v.searchKeys) > 0 {
+		for _, k := range v.searchKeys {
+			if r, ok := v.searchKeyRanges[k]; ok {
+				ranges = append(ranges, r)
+			}
+		}
+	}
+	allowed := func(line int) bool {
+		if len(ranges) == 0 {
+			return true
+		}
+		for _, r := range ranges {
+			if line >= r.start && line <= r.end {
+				return true
+			}
+		}
+		return false
+	}
+
+	foldStarts := make([]int, 0, len(v.foldRanges))
+	for s := range v.foldRanges {
+		foldStarts = append(foldStarts, s)
+	}
+	sort.Ints(foldStarts)
+
+	keepBlocks := make(map[int]struct{})
+	keepLines := make(map[int]struct{})
+
+	for line := range matchSet {
+		if !allowed(line) {
+			continue
+		}
+		keepLines[line] = struct{}{}
+		for _, s := range foldStarts {
+			end := v.foldRanges[s]
+			if s <= line && line <= end {
+				keepBlocks[s] = struct{}{}
+			}
+		}
+	}
+
+	for s := range keepBlocks {
+		keepLines[s] = struct{}{}
+		end := v.foldRanges[s]
+		if allowed(end) {
+			keepLines[end] = struct{}{}
+		}
+		prev := s - 1
+		if prev >= 0 && allowed(prev) && isKeyLineWithoutBrace(v.fullLines[prev]) {
+			keepLines[prev] = struct{}{}
+		}
+	}
+
+	for i := 0; i < len(v.fullLines); {
+		if !allowed(i) {
+			i++
+			continue
+		}
+		if end, ok := v.foldRanges[i]; ok {
+			if _, keep := keepBlocks[i]; !keep {
+				i = end + 1
+				continue
+			}
+		}
+		if _, ok := keepLines[i]; ok {
+			v.viewLines = append(v.viewLines, v.fullLines[i])
+			v.lineMap = append(v.lineMap, i)
+		}
+		i++
+	}
+}
+
+func isKeyLineWithoutBrace(line string) bool {
+	if _, _, ok := findKeyRange(line); !ok {
+		return false
+	}
+	idx, _ := findFoldToken(line)
+	return idx == -1
 }
 
 // escEntry provides a small helper to close the search on Escape.

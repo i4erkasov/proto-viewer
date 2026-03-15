@@ -608,17 +608,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 		sel := searchselect.NewSearchableSelect(w, "Search preset…", list, false)
 		sel.OnChangedSingle(func(name string) {
-			if strings.TrimSpace(name) == "" {
-				return
-			}
-			p, ok := loadPreset(name)
-			if !ok {
-				return
-			}
-			protoRoot.SetText(p.ProtoRoot)
-			protoFile.SetText(p.ProtoFile)
-			loadProtoTypesAndSelect(p.ProtoFile, p.MessageType)
-			closeLoadPresetDialog()
+			_ = name
 		})
 
 		btnDelete := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
