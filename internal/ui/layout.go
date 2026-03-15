@@ -342,7 +342,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	}
 
 	// тип выбран из списка
-	typeSelect := searchselect.NewSearchableSelect(w, "Select message type…", []string{})
+	typeSelect := searchselect.NewSearchableSelect(w, "Select message type…", []string{}, false)
 
 	// message type validation/error hint (english)
 	typeErr := widget.NewLabel("")
@@ -360,6 +360,11 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		typeErr.Show()
 		typeErr.Refresh()
 	}
+
+	typeSelect.OnChangedSingle(func(v string) {
+		noteTypeError("")
+		_ = v
+	})
 
 	loadProtoTypesAndSelect := func(path string, desiredType string) {
 		path = strings.TrimSpace(path)
@@ -601,7 +606,20 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			dialog.ShowInformation("Load preset", "No saved presets", w)
 			return
 		}
-		sel := searchselect.NewSearchableSelect(w, "Search preset…", list)
+		sel := searchselect.NewSearchableSelect(w, "Search preset…", list, false)
+		sel.OnChangedSingle(func(name string) {
+			if strings.TrimSpace(name) == "" {
+				return
+			}
+			p, ok := loadPreset(name)
+			if !ok {
+				return
+			}
+			protoRoot.SetText(p.ProtoRoot)
+			protoFile.SetText(p.ProtoFile)
+			loadProtoTypesAndSelect(p.ProtoFile, p.MessageType)
+			closeLoadPresetDialog()
+		})
 
 		btnDelete := widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {
 			name := strings.TrimSpace(sel.Selected())

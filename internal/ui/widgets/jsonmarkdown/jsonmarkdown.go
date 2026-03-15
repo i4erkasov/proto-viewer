@@ -125,20 +125,11 @@ func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 		}
 	})
 
-	v.searchKeySelect = searchselect.NewSearchableSelect(win, searchKeyPrompt, nil)
+	v.searchKeySelect = searchselect.NewSearchableSelect(win, searchKeyPrompt, nil, true)
 	v.searchKeySelect.SetTextStyle(fyne.TextStyle{})
 	v.searchKeySelect.SetMinWidth(200)
-	v.searchKeySelect.SetMultiSelect(true)
-	v.searchKeySelect.OnChangedMulti = func(keys []string) {
+	v.searchKeySelect.OnChanged = func(keys []string) {
 		selected := normalizeKeys(keys)
-		v.mu.Lock()
-		v.searchKeys = selected
-		v.mu.Unlock()
-		v.applyKeyFilterKeys(selected)
-		v.applySearchAsync(v.searchEntry.Text)
-	}
-	v.searchKeySelect.OnChanged = func(s string) {
-		selected := normalizeKeys([]string{s})
 		v.mu.Lock()
 		v.searchKeys = selected
 		v.mu.Unlock()
@@ -1024,12 +1015,13 @@ func (v *JSONMarkdownView) handleSecondaryTap(pos fyne.Position) {
 	}
 
 	keyItem := fyne.NewMenuItem("Copy", func() {
-		if fullKey != "" && fullVal != "" {
-			v.win.Clipboard().SetContent(wrapCopyContent(fullKey + ": " + fullVal))
+		keyOut := quoteKeyIfNeeded(fullKey)
+		if keyOut != "" && fullVal != "" {
+			v.win.Clipboard().SetContent(wrapCopyContent(keyOut + ": " + fullVal))
 			return
 		}
-		if fullKey != "" {
-			v.win.Clipboard().SetContent(wrapCopyContent(fullKey))
+		if keyOut != "" {
+			v.win.Clipboard().SetContent(wrapCopyContent(keyOut))
 			return
 		}
 		if fullVal != "" {
@@ -1937,8 +1929,22 @@ func (v *JSONMarkdownView) SelectedKeyValueString() string {
 	if strings.TrimSpace(v.selectedValueText) != "" {
 		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
 	}
-	return wrapCopyContent(strings.TrimSpace(v.selectedKeyValue))
+	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
 }
+
+func quoteKeyIfNeeded(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ""
+	}
+	// If already quoted (rare), keep as-is.
+	if strings.HasPrefix(key, "\"") && strings.HasSuffix(key, "\"") {
+		return key
+	}
+	return "\"" + key + "\""
+}
+
+// --- end JSON color palette
 
 func (v *JSONMarkdownView) fullValueForLine(srcLine int) (string, bool) {
 	v.mu.Lock()

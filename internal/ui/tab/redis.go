@@ -123,7 +123,7 @@ func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
 	t.dbSelect.Disable()
 
 	// Key selector with search.
-	t.keySelect = searchselect.NewSearchableSelect(w, "Select key…", []string{})
+	t.keySelect = searchselect.NewSearchableSelect(w, "Select key…", []string{}, false)
 	t.keySelect.Disable()
 
 	t.fieldSelect = widget.NewSelect([]string{}, nil)
@@ -202,9 +202,9 @@ func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
 	t.dbSelect.OnChanged = func(s string) {
 		t.onDBSelected(s)
 	}
-	t.keySelect.OnChanged = func(s string) {
+	t.keySelect.OnChangedSingle(func(s string) {
 		t.onKeySelected(s)
-	}
+	})
 	t.fieldSelect.OnChanged = func(s string) {
 		t.selectedField = s
 	}

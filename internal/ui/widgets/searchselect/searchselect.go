@@ -51,11 +51,13 @@ func (e *focusLostEntry) TypedKey(ev *fyne.KeyEvent) {
 //   - Esc   : close
 //
 // API:
-//   - NewSearchableSelect(win, options)
-//   - OnChanged func(string)
+//   - NewSearchableSelect(win, placeholder, options, multi)
+//   - OnChanged func([]string)
 //   - SetOptions([]string)
 //   - Selected() string
+//   - SelectedValues() []string
 //   - SetSelected(string)
+//   - SetSelectedValues([]string)
 //   - Enable()/Disable()
 //
 // Notes:
@@ -91,8 +93,7 @@ type SearchableSelect struct {
 
 	prevOnTypedKey func(*fyne.KeyEvent)
 
-	OnChanged      func(string)
-	OnChangedMulti func([]string)
+	OnChanged func([]string)
 
 	frameWrap *fyne.Container
 	bg        *canvas.Rectangle
@@ -110,12 +111,13 @@ type SearchableSelect struct {
 	selectedValues []string
 }
 
-func NewSearchableSelect(win fyne.Window, placeholder string, options []string) *SearchableSelect {
+func NewSearchableSelect(win fyne.Window, placeholder string, options []string, multi bool) *SearchableSelect {
 	ss := &SearchableSelect{win: win, highlight: -1, placeholder: placeholder}
 	ss.minWidth = 220
 	ss.allowEmpty = true
 	ss.emptyLabel = "Not selected"
 	ss.selectedSet = make(map[string]struct{})
+	ss.multi = multi
 
 	ss.label = widget.NewLabel("")
 	ss.label.Alignment = fyne.TextAlignLeading
@@ -490,6 +492,29 @@ func (ss *SearchableSelect) SetMultiSelect(multi bool) {
 	ss.updateButtonLabel()
 }
 
+func (ss *SearchableSelect) SelectedValue() string {
+	if ss.multi {
+		if len(ss.selectedValues) == 0 {
+			return ""
+		}
+		return ss.selectedValues[0]
+	}
+	return ss.selected
+}
+
+func (ss *SearchableSelect) OnChangedSingle(fn func(string)) {
+	ss.OnChanged = func(values []string) {
+		if fn == nil {
+			return
+		}
+		if len(values) == 0 {
+			fn("")
+			return
+		}
+		fn(values[0])
+	}
+}
+
 func (ss *SearchableSelect) SetOptions(opts []string) {
 	ss.options = ss.options[:0]
 	for _, s := range opts {
@@ -700,16 +725,13 @@ func (ss *SearchableSelect) pickByFilteredIndex(idx int) {
 		ss.applyTextStyle()
 		ss.updateButtonLabel()
 		if ss.OnChanged != nil {
-			ss.OnChanged(ss.Selected())
-		}
-		if ss.OnChangedMulti != nil {
-			ss.OnChangedMulti(ss.SelectedValues())
+			ss.OnChanged(ss.SelectedValues())
 		}
 		return
 	}
 	ss.SetSelected(v)
 	if ss.OnChanged != nil {
-		ss.OnChanged(v)
+		ss.OnChanged([]string{v})
 	}
 
 	// Close the popup on selection (mouse or keyboard).
@@ -845,14 +867,17 @@ func (ss *SearchableSelect) Clear() {
 	if ss.multi {
 		ss.setSelectedValues(nil)
 		ss.updateButtonLabel()
-		if ss.OnChangedMulti != nil {
-			ss.OnChangedMulti(ss.SelectedValues())
+		if ss.OnChanged != nil {
+			ss.OnChanged(nil)
 		}
 		return
 	}
 	ss.SetSelected("")
 	if ss.search != nil {
 		ss.search.SetText("")
+	}
+	if ss.OnChanged != nil {
+		ss.OnChanged(nil)
 	}
 }
 

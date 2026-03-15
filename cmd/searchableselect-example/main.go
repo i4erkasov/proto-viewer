@@ -22,10 +22,14 @@ func main() {
 	}
 
 	label := widget.NewLabel("Selected: (none)")
-	ss := searchselect.NewSearchableSelect(w, "Search...", options)
-	ss.OnChanged = func(v string) {
-		label.SetText("Selected: " + v)
-		log.Println("selected:", v)
+	ss := searchselect.NewSearchableSelect(w, "Search...", options, false)
+	ss.OnChanged = func(values []string) {
+		selected := ""
+		if len(values) > 0 {
+			selected = values[0]
+		}
+		label.SetText("Selected: " + selected)
+		log.Println("selected:", selected)
 	}
 
 	content := container.NewVBox(
