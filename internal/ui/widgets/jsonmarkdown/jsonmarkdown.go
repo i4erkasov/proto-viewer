@@ -955,7 +955,9 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 		return
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
-	if len(v.searchKeys) > 0 {
+	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
+		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
+	} else if len(v.searchKeys) > 0 {
 		v.rebuildViewLinesForKeysLocked(v.searchKeys)
 	} else {
 		v.rebuildViewLinesLocked()
@@ -1541,15 +1543,10 @@ func (v *JSONMarkdownView) navigateMatch(step int) {
 	if v.expandForLineLocked(line) {
 		v.rebuildViewLinesLocked()
 	}
-	if len(v.searchKeys) > 0 {
-		for _, k := range v.searchKeys {
-			if rng, ok := v.searchKeyRanges[k]; ok {
-				if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
-					v.rebuildViewLinesForKeysLocked(v.searchKeys)
-					break
-				}
-			}
-		}
+	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
+		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
+	} else if len(v.searchKeys) > 0 {
+		v.rebuildViewLinesForKeysLocked(v.searchKeys)
 	}
 	row := findViewRow(v.lineMap, line)
 	v.ensureLoadedForRowLocked(row)
