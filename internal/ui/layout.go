@@ -354,21 +354,92 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		typeErr.Refresh()
 	}
 
-	resetProtoSelection := func() {
-		protoFile.SetText("")
-		typeSelect.SetOptions(nil)
-		typeSelect.SetSelected("")
-		noteTypeError("")
-	}
-
-	protoRoot.OnChanged = func(s string) {
-		prefs.SetString(prefLastProtoRoot, strings.TrimSpace(s))
-		if strings.TrimSpace(protoFile.Text) == "" {
+	loadProtoTypesAndSelect := func(path string, desiredType string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
 			return
 		}
-		if !isInsideRoot(s, protoFile.Text) {
-			resetProtoSelection()
-		}
+		lblStatus.SetText("Status: parsing proto…")
+		go func(protoPath string, desired string) {
+			fi, err := os.Stat(protoPath)
+			if err != nil {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: error")
+					dialog.ShowError(err, w)
+				})
+				return
+			}
+
+			protoTypeCache.mu.Lock()
+			ce, ok := protoTypeCache.items[protoPath]
+			protoTypeCache.mu.Unlock()
+			if ok && ce.mtime == fi.ModTime().Unix() && ce.size == fi.Size() {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: OK")
+					typeSelect.SetOptions(ce.opts)
+					typeSelect.SetSelected("")
+					noteTypeError("")
+					if strings.TrimSpace(desired) != "" {
+						selected := false
+						for _, opt := range ce.opts {
+							if opt == desired {
+								selected = true
+								break
+							}
+						}
+						if selected {
+							typeSelect.SetSelected(desired)
+						} else {
+							dialog.ShowInformation("Message type", "Message type не найден в proto: "+desired, w)
+						}
+					}
+				})
+				return
+			}
+
+			b, err := os.ReadFile(protoPath)
+			if err != nil {
+				fyne.Do(func() {
+					lblStatus.SetText("Status: error")
+					dialog.ShowError(err, w)
+				})
+				return
+			}
+			pkg, msgs := protoutil.ParseProtoForTypes(b)
+			opts := make([]string, 0, len(msgs))
+			for _, m := range msgs {
+				full := m
+				if pkg != "" {
+					full = pkg + "." + m
+				}
+				opts = append(opts, full)
+			}
+
+			protoTypeCache.mu.Lock()
+			protoTypeCache.items[protoPath] = protoTypeCacheEntry{mtime: fi.ModTime().Unix(), size: fi.Size(), opts: opts}
+			protoTypeCache.mu.Unlock()
+
+			fyne.Do(func() {
+				lblStatus.SetText("Status: OK")
+				typeSelect.SetOptions(opts)
+				typeSelect.SetSelected("")
+				noteTypeError("")
+				if strings.TrimSpace(desired) != "" {
+					selected := false
+					for _, opt := range opts {
+						if opt == desired {
+							selected = true
+							break
+						}
+					}
+					if selected {
+						typeSelect.SetSelected(desired)
+					} else {
+						dialog.ShowInformation("Message type", "Message type не найден в proto: "+desired, w)
+					}
+				}
+			})
+		}(path, strings.TrimSpace(desiredType))
 	}
 
 	// ---- Source tabs (File/Redis/SQL)
@@ -445,6 +516,23 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		return p, true
 	}
 
+	findPresetByMessageType := func(msgType string) (string, bool) {
+		msgType = strings.TrimSpace(msgType)
+		if msgType == "" {
+			return "", false
+		}
+		for _, name := range loadPresetIndex() {
+			p, ok := loadPreset(name)
+			if !ok {
+				continue
+			}
+			if strings.TrimSpace(p.MessageType) == msgType {
+				return name, true
+			}
+		}
+		return "", false
+	}
+
 	deletePreset := func(name string) {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -483,6 +571,14 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				name := strings.TrimSpace(nameEntry.Text)
 				if name == "" {
 					name = mtype
+				}
+				if existing, ok := findPresetByMessageType(mtype); ok {
+					display := strings.TrimSpace(existing)
+					if display == "" {
+						display = mtype
+					}
+					dialog.ShowInformation("Save preset", "Уже есть сохраненный message type: "+display, w)
+					return
 				}
 				savePreset(name, presetEntry{ProtoRoot: root, ProtoFile: pfile, MessageType: mtype})
 			},
@@ -533,7 +629,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			}
 			protoRoot.SetText(p.ProtoRoot)
 			protoFile.SetText(p.ProtoFile)
-			typeSelect.SetSelected(p.MessageType)
+			loadProtoTypesAndSelect(p.ProtoFile, p.MessageType)
 			closeLoadPresetDialog()
 		})
 		btnLoad.Importance = widget.HighImportance
@@ -602,59 +698,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 		p, err := protopicker.New(w, root, func(absP string) {
 			protoFile.SetText(absP)
-			lblStatus.SetText("Status: parsing proto…")
-			go func(path string) {
-				fi, err := os.Stat(path)
-				if err != nil {
-					fyne.Do(func() {
-						lblStatus.SetText("Status: error")
-						dialog.ShowError(err, w)
-					})
-					return
-				}
-
-				protoTypeCache.mu.Lock()
-				ce, ok := protoTypeCache.items[path]
-				protoTypeCache.mu.Unlock()
-				if ok && ce.mtime == fi.ModTime().Unix() && ce.size == fi.Size() {
-					fyne.Do(func() {
-						lblStatus.SetText("Status: OK")
-						typeSelect.SetOptions(ce.opts)
-						typeSelect.SetSelected("")
-						noteTypeError("")
-					})
-					return
-				}
-
-				b, err := os.ReadFile(path)
-				if err != nil {
-					fyne.Do(func() {
-						lblStatus.SetText("Status: error")
-						dialog.ShowError(err, w)
-					})
-					return
-				}
-				pkg, msgs := protoutil.ParseProtoForTypes(b)
-				opts := make([]string, 0, len(msgs))
-				for _, m := range msgs {
-					full := m
-					if pkg != "" {
-						full = pkg + "." + m
-					}
-					opts = append(opts, full)
-				}
-
-				protoTypeCache.mu.Lock()
-				protoTypeCache.items[path] = protoTypeCacheEntry{mtime: fi.ModTime().Unix(), size: fi.Size(), opts: opts}
-				protoTypeCache.mu.Unlock()
-
-				fyne.Do(func() {
-					lblStatus.SetText("Status: OK")
-					typeSelect.SetOptions(opts)
-					typeSelect.SetSelected("")
-					noteTypeError("")
-				})
-			}(absP)
+			loadProtoTypesAndSelect(absP, "")
 		})
 		if err != nil {
 			dialog.ShowError(err, w)
