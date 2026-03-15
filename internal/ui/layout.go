@@ -1131,8 +1131,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		isOutputExpanded = !isOutputExpanded
 		if isOutputExpanded {
 			savedSize = w.Canvas().Size()
-			setSearchVisible(false)
-			setJSONSearchVisible(false)
 			btnToggleOutput.Hide()
 			btnCollapse.Show()
 			globalBar.Hide()

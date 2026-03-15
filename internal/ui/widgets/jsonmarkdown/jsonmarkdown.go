@@ -145,8 +145,8 @@ func NewJSONMarkdownView(win fyne.Window) *JSONMarkdownView {
 	v.searchStructChk = widget.NewCheck("Only matches", func(checked bool) {
 		v.SetSearchStructural(checked)
 	})
-	v.searchStructChk.SetChecked(true)
-	v.searchStructural = true
+	v.searchStructChk.SetChecked(false)
+	v.searchStructural = false
 	v.searchStructWrap = container.NewGridWrap(v.searchStructChk.MinSize(), v.searchStructChk)
 
 	v.searchUp = widget.NewButtonWithIcon("", theme.MoveUpIcon(), func() {
@@ -289,6 +289,11 @@ func (v *JSONMarkdownView) SetSearchVisible(show bool) {
 	}
 	v.searchEntry.SetText("")
 	v.applySearchAsync("")
+	v.mu.Lock()
+	v.searchKeys = nil
+	v.mu.Unlock()
+	v.searchKeySelect.SetSelectedValues(nil)
+	v.applyKeyFilterKeys(nil)
 	v.searchWrap.Hide()
 	v.searchWrap.Refresh()
 }
