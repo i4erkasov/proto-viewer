@@ -32,7 +32,6 @@ const (
 // JSONMarkdownView renders JSON as markdown with lazy line loading.
 type JSONMarkdownView struct {
 	mu        sync.Mutex
-	fullLines []string
 	viewLines []string
 	lineMap   []int
 	loaded    int
@@ -82,7 +81,6 @@ type JSONMarkdownView struct {
 	searchKeyFold    map[string]int
 	searchSeq        uint64
 	searchMatchSet   map[int]struct{}
-	searchQueryLower []byte
 	trigramIndex     map[[3]byte][]int32
 	trigramEnabled   bool
 	trigramCapBytes  int
@@ -324,7 +322,6 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchKeyRanges = nil
 	v.searchKeyFold = nil
 	v.searchMatchSet = nil
-	v.searchQueryLower = nil
 	v.trigramIndex = nil
 	v.trigramEnabled = false
 	v.trigramCapBytes = 0
@@ -377,7 +374,6 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 
 	v.mu.Lock()
 	v.fullBuf = buf
-	v.fullLines = nil
 	v.foldRanges = foldRanges
 	v.folded = make(map[int]bool, len(foldRanges))
 	for start := range foldRanges {
@@ -1406,7 +1402,6 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	trigramEnabled := v.trigramEnabled
 	trigramIndex := v.trigramIndex
 	v.searchQuery = query
-	v.searchQueryLower = asciiLowerBytes([]byte(query))
 	for _, k := range keys {
 		if rng, ok := keyRanges[k]; ok {
 			if len(v.lineMap) == 0 || v.lineMap[0] < rng.start || v.lineMap[len(v.lineMap)-1] > rng.end {
@@ -1415,9 +1410,9 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 			}
 		}
 	}
-	queryLower := append([]byte(nil), v.searchQueryLower...)
 	v.mu.Unlock()
 
+	queryLower := asciiLowerBytes([]byte(query))
 	if len(queryLower) == 0 {
 		fyne.Do(func() {
 			if seq != atomic.LoadUint64(&v.searchSeq) {
@@ -1764,37 +1759,6 @@ func extractLineKey(line string) (string, bool) {
 	return "", false
 }
 
-func collectJSONKeys(v any) []string {
-	if v == nil {
-		return nil
-	}
-	set := make(map[string]struct{})
-	collectKeysRecursive(v, set)
-	if len(set) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(set))
-	for k := range set {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func collectKeysRecursive(v any, set map[string]struct{}) {
-	switch t := v.(type) {
-	case map[string]any:
-		for k, child := range t {
-			set[k] = struct{}{}
-			collectKeysRecursive(child, set)
-		}
-	case []any:
-		for _, child := range t {
-			collectKeysRecursive(child, set)
-		}
-	}
-}
-
 func collectTopLevelKeys(v any) []string {
 	root, ok := v.(map[string]any)
 	if !ok || len(root) == 0 {
@@ -1930,13 +1894,10 @@ func findHighlightRangesASCII(line string, queryLower []byte) []highlightRange {
 func (v *JSONMarkdownView) fullLineBytes(i int) []byte {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
-		return v.fullBuf.Line(i)
-	}
-	if i < 0 || i >= len(v.fullLines) {
+	if v.fullBuf == nil {
 		return nil
 	}
-	return []byte(v.fullLines[i])
+	return v.fullBuf.Line(i)
 }
 
 func asciiLowerBytes(in []byte) []byte {
@@ -2056,70 +2017,17 @@ func splitLinesFromBuffer(b *JSONBuffer) []string {
 }
 
 func (v *JSONMarkdownView) fullLineCountLocked() int {
-	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
+	if v.fullBuf != nil {
 		return v.fullBuf.LineCount()
 	}
-	return len(v.fullLines)
+	return 0
 }
 
 func (v *JSONMarkdownView) fullLineLocked(i int) string {
-	if v.fullBuf != nil && v.fullBuf.LineCount() > 0 {
+	if v.fullBuf != nil {
 		return v.fullBuf.LineString(i)
 	}
-	if i < 0 || i >= len(v.fullLines) {
-		return ""
-	}
-	return v.fullLines[i]
-}
-
-func wrapCopyContent(s string) string {
-	trimmed := strings.TrimSpace(s)
-	if trimmed == "" {
-		return s
-	}
-	if strings.Contains(trimmed, "\n") {
-		return "{\n" + trimmed + "\n}"
-	}
-	return "{" + trimmed + "}"
-}
-
-func normalizeKeys(keys []string) []string {
-	if len(keys) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(keys))
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		k = strings.TrimSpace(k)
-		if k == "" {
-			continue
-		}
-		if _, ok := seen[k]; ok {
-			continue
-		}
-		seen[k] = struct{}{}
-		out = append(out, k)
-	}
-	return out
-}
-
-func unionCandidateLines(index map[string][]int, keys []string) []int {
-	if len(keys) == 0 || index == nil {
-		return nil
-	}
-	seen := make(map[int]struct{})
-	out := make([]int, 0)
-	for _, k := range keys {
-		for _, ln := range index[k] {
-			if _, ok := seen[ln]; ok {
-				continue
-			}
-			seen[ln] = struct{}{}
-			out = append(out, ln)
-		}
-	}
-	sort.Ints(out)
-	return out
+	return ""
 }
 
 func buildFoldRangesWithDepth(lines []string) (map[int]int, map[int]int) {
@@ -2342,6 +2250,56 @@ func (v *JSONMarkdownView) fullValueForLineLocked(srcLine int) (string, bool) {
 	return "", false
 }
 
+func wrapCopyContent(s string) string {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return s
+	}
+	if strings.Contains(trimmed, "\n") {
+		return "{\n" + trimmed + "\n}"
+	}
+	return "{" + trimmed + "}"
+}
+
+func normalizeKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(keys))
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		if _, ok := seen[k]; ok {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+func unionCandidateLines(index map[string][]int, keys []string) []int {
+	if len(keys) == 0 || index == nil {
+		return nil
+	}
+	seen := make(map[int]struct{})
+	out := make([]int, 0)
+	for _, k := range keys {
+		for _, ln := range index[k] {
+			if _, ok := seen[ln]; ok {
+				continue
+			}
+			seen[ln] = struct{}{}
+			out = append(out, ln)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
 func quoteKeyIfNeeded(key string) string {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -2351,20 +2309,6 @@ func quoteKeyIfNeeded(key string) string {
 		return key
 	}
 	return "\"" + key + "\""
-}
-
-func (v *JSONMarkdownView) SelectedKeyValueString() string {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.selectedValueLine >= 0 {
-		if val, ok := v.fullValueForLineLocked(v.selectedValueLine); ok {
-			return wrapCopyContent(strings.TrimSpace(val))
-		}
-	}
-	if strings.TrimSpace(v.selectedValueText) != "" {
-		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
-	}
-	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
 }
 
 func (v *JSONMarkdownView) buildTrigramIndexLocked(lines []string, dataSize int) {
@@ -2534,4 +2478,18 @@ func toLowerASCII(b byte) byte {
 		return b + ('a' - 'A')
 	}
 	return b
+}
+
+func (v *JSONMarkdownView) SelectedKeyValueString() string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.selectedValueLine >= 0 {
+		if val, ok := v.fullValueForLineLocked(v.selectedValueLine); ok {
+			return wrapCopyContent(strings.TrimSpace(val))
+		}
+	}
+	if strings.TrimSpace(v.selectedValueText) != "" {
+		return wrapCopyContent(strings.TrimSpace(v.selectedValueText))
+	}
+	return wrapCopyContent(quoteKeyIfNeeded(strings.TrimSpace(v.selectedKeyValue)))
 }
