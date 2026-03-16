@@ -1554,7 +1554,7 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 		return nil
 	}
 	cells := make([]widget.TextGridCell, 0, len(line))
-	pending := ""
+	pending := make([]byte, 0, 32)
 	pendingColor := theme.ForegroundColor()
 	rangeIndex := 0
 	pos := 0
@@ -1583,10 +1583,10 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 		return adj >= selected.start && adj < selected.end
 	}
 	flush := func() {
-		if pending == "" {
+		if len(pending) == 0 {
 			return
 		}
-		for _, r := range pending {
+		for _, b := range pending {
 			style := &widget.CustomTextGridStyle{FGColor: pendingColor}
 			if inHighlight(pos) {
 				style.BGColor = highlightColor()
@@ -1597,39 +1597,55 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 			if pos < prefixLen {
 				style.BGColor = lineNumberBgColor()
 			}
-			cells = append(cells, widget.TextGridCell{Rune: r, Style: style})
+			cells = append(cells, widget.TextGridCell{Rune: rune(b), Style: style})
 			pos++
 		}
-		pending = ""
+		pending = pending[:0]
 	}
-	setPending := func(text string, c color.Color) {
-		if pending != "" && c != pendingColor {
+	setPending := func(text []byte, c color.Color) {
+		if len(pending) > 0 && c != pendingColor {
 			flush()
 		}
 		pendingColor = c
-		pending += text
+		pending = append(pending, text...)
 	}
 
-	runes := []rune(string(line))
-	i := 0
-	for i < len(runes) {
-		r := runes[i]
+	isSpace := func(b byte) bool {
+		switch b {
+		case ' ', '\t', '\n', '\r':
+			return true
+		default:
+			return false
+		}
+	}
+	isNumberStartByte := func(b byte, next byte) bool {
+		if b == '-' {
+			return next >= '0' && next <= '9'
+		}
+		return b >= '0' && b <= '9'
+	}
+	isNumberCharByte := func(b byte) bool {
+		return (b >= '0' && b <= '9') || b == '.' || b == 'e' || b == 'E' || b == '+' || b == '-'
+	}
+
+	for i := 0; i < len(line); {
+		b := line[i]
 
 		if i < prefixLen {
 			j := i + 1
-			for j < len(runes) && j < prefixLen {
+			for j < len(line) && j < prefixLen {
 				j++
 			}
-			setPending(string(runes[i:j]), theme.ForegroundColor())
+			setPending(line[i:j], theme.ForegroundColor())
 			i = j
 			continue
 		}
 
-		if r == '"' {
+		if b == '"' {
 			j := i + 1
 			esc := false
-			for j < len(runes) {
-				ch := runes[j]
+			for j < len(line) {
+				ch := line[j]
 				if esc {
 					esc = false
 					j++
@@ -1646,12 +1662,12 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 				}
 				j++
 			}
-			lit := string(runes[i:j])
+			lit := line[i:j]
 			k := j
-			for k < len(runes) && unicode.IsSpace(runes[k]) {
+			for k < len(line) && isSpace(line[k]) {
 				k++
 			}
-			if k < len(runes) && runes[k] == ':' {
+			if k < len(line) && line[k] == ':' {
 				setPending(lit, jsonKeyColor())
 			} else {
 				setPending(lit, jsonStringColor())
@@ -1660,53 +1676,55 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 			continue
 		}
 
-		if unicode.IsSpace(r) {
+		if isSpace(b) {
 			j := i + 1
-			for j < len(runes) && unicode.IsSpace(runes[j]) {
+			for j < len(line) && isSpace(line[j]) {
 				j++
 			}
-			setPending(string(runes[i:j]), jsonPunctColor())
+			setPending(line[i:j], jsonPunctColor())
 			i = j
 			continue
 		}
 
-		if hasWord(runes, i, "true") {
-			setPending("true", jsonBoolColor())
+		if b == 't' && i+3 < len(line) && line[i+1] == 'r' && line[i+2] == 'u' && line[i+3] == 'e' {
+			setPending(line[i:i+4], jsonBoolColor())
 			i += 4
 			continue
 		}
-		if hasWord(runes, i, "false") {
-			setPending("false", jsonBoolColor())
+		if b == 'f' && i+4 < len(line) && line[i+1] == 'a' && line[i+2] == 'l' && line[i+3] == 's' && line[i+4] == 'e' {
+			setPending(line[i:i+5], jsonBoolColor())
 			i += 5
 			continue
 		}
-		if hasWord(runes, i, "null") {
-			setPending("null", jsonNullColor())
+		if b == 'n' && i+3 < len(line) && line[i+1] == 'u' && line[i+2] == 'l' && line[i+3] == 'l' {
+			setPending(line[i:i+4], jsonNullColor())
 			i += 4
 			continue
 		}
 
-		if isNumberStart(runes, i) {
+		if isNumberStartByte(b, func() byte {
+			if i+1 < len(line) {
+				return line[i+1]
+			}
+			return 0
+		}()) {
 			j := i + 1
-			for j < len(runes) && isNumberChar(runes[j]) {
+			for j < len(line) && isNumberCharByte(line[j]) {
 				j++
 			}
-			num := string(runes[i:j])
-			if _, err := strconv.ParseFloat(num, 64); err == nil {
-				setPending(num, jsonNumberColor())
-				i = j
-				continue
-			}
+			setPending(line[i:j], jsonNumberColor())
+			i = j
+			continue
 		}
 
-		switch r {
+		switch b {
 		case '{', '}', '[', ']', ':', ',':
-			setPending(string(r), jsonPunctColor())
+			setPending(line[i:i+1], jsonPunctColor())
 			i++
 			continue
 		}
 
-		setPending(string(r), theme.ForegroundColor())
+		setPending(line[i:i+1], theme.ForegroundColor())
 		i++
 	}
 	flush()
