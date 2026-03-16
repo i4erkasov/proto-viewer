@@ -1046,6 +1046,12 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 		return
 	}
 
+	anchorByte := byte(0)
+	useAnchor := len(queryLower) >= 4
+	if useAnchor {
+		anchorByte = queryLower[len(queryLower)/2]
+	}
+
 	var candidates []int
 	if len(keys) == 0 {
 		candidates = allLines
@@ -1067,6 +1073,9 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 		for _, i := range candidates {
 			lineBytes := v.fullLineBytes(i)
 			if len(lineBytes) == 0 {
+				continue
+			}
+			if useAnchor && bytes.IndexByte(lineBytes, anchorByte) < 0 {
 				continue
 			}
 			if !containsFoldASCII(lineBytes, queryLower) {
