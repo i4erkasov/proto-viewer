@@ -4,6 +4,7 @@ package jsonmarkdown
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"image/color"
 	"sort"
@@ -345,22 +346,16 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 
 	data := []byte(s)
 	prettyBytes := data
-	var parsed any
-	parsedOK := false
 
 	if sonic.Valid(data) {
-		if err := sonic.Unmarshal(data, &parsed); err == nil {
-			parsedOK = true
-			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
-				prettyBytes = b
-			}
+		var buf bytes.Buffer
+		if err := json.Indent(&buf, data, "", "  "); err == nil {
+			prettyBytes = buf.Bytes()
 		}
 	}
 
 	bundle := buildIndexBundleFromBytes(prettyBytes)
-	if parsedOK {
-		bundle.topKeys = collectTopLevelKeys(parsed)
-	}
+	// parsedOK/parsed больше не используются
 
 	v.mu.Lock()
 	v.fullBuf = bundle.buf
