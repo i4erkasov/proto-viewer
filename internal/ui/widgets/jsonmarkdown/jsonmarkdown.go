@@ -81,7 +81,8 @@ type JSONMarkdownView struct {
 	searchKeyFold    map[string]int
 	searchSeq        uint64
 	searchMatchSet   map[int]struct{}
-	trigramIndex     map[[3]byte][]int32
+	trigramIndex     map[[3]byte]trigramRange
+	trigramPostings  []int32
 	trigramEnabled   bool
 	trigramCapBytes  int
 	trigramUsedBytes int
@@ -348,46 +349,42 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	parsedOK := false
 
 	if sonic.Valid(data) {
-		needsPretty := !bytes.Contains(data, []byte("\n"))
-		if needsPretty {
-			if err := sonic.Unmarshal(data, &parsed); err == nil {
-				parsedOK = true
-				if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
-					prettyBytes = b
-				}
+		if err := sonic.Unmarshal(data, &parsed); err == nil {
+			parsedOK = true
+			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
+				prettyBytes = b
 			}
 		}
 	}
 
-	buf := newJSONBufferFromBytes(prettyBytes)
-	foldRanges, foldDepths := buildFoldRangesWithDepthBuffer(buf)
-	index, keyRanges, allLines, keyFold := buildSearchIndexBuffer(buf, foldRanges)
-	lineNumWidth := len(strconv.Itoa(buf.LineCount()))
-
-	topKeys := topKeysFromRanges(keyRanges)
+	bundle := buildIndexBundleFromBytes(prettyBytes)
 	if parsedOK {
-		topKeys = collectTopLevelKeys(parsed)
+		bundle.topKeys = collectTopLevelKeys(parsed)
 	}
 
 	v.mu.Lock()
-	v.fullBuf = buf
-	v.foldRanges = foldRanges
-	v.folded = make(map[int]bool, len(foldRanges))
-	for start := range foldRanges {
-		if foldDepths[start] > 0 {
+	v.fullBuf = bundle.buf
+	v.foldRanges = bundle.foldRanges
+	v.folded = make(map[int]bool, len(bundle.foldRanges))
+	for start := range bundle.foldRanges {
+		if bundle.foldDepths[start] > 0 {
 			v.folded[start] = true
 		}
 	}
-	v.searchKeyIndex = index
-	v.searchAll = allLines
-	v.searchKeyRanges = keyRanges
-	v.searchKeyFold = keyFold
-	v.lineNumWidth = lineNumWidth
-	v.buildTrigramIndexLocked(buf, len(prettyBytes))
+	v.searchKeyIndex = bundle.searchIndex
+	v.searchAll = bundle.searchAll
+	v.searchKeyRanges = bundle.keyRanges
+	v.searchKeyFold = bundle.keyFold
+	v.lineNumWidth = bundle.lineNumWidth
+	v.trigramIndex = bundle.trigramIndex
+	v.trigramPostings = bundle.trigramPostings
+	v.trigramEnabled = bundle.trigramEnabled
+	v.trigramCapBytes = bundle.trigramCapBytes
+	v.trigramUsedBytes = bundle.trigramUsedBytes
 	v.rebuildViewLinesLocked()
 	v.mu.Unlock()
 
-	v.setSearchKeys(topKeys)
+	v.setSearchKeys(bundle.topKeys)
 	v.loadMore()
 }
 
@@ -674,13 +671,6 @@ func (v *JSONMarkdownView) handleTap(pos fyne.Position) {
 	}
 	if v.loaded == 0 && len(v.viewLines) > 0 {
 		v.loaded = minInt(v.chunk, len(v.viewLines))
-	}
-	if !v.folded[srcLine] {
-		if foldEnd, ok := v.foldRanges[srcLine]; ok && foldEnd > srcLine {
-			if endRow := findViewRow(v.viewLines, foldEnd); endRow >= 0 {
-				v.ensureLoadedForRowLocked(endRow)
-			}
-		}
 	}
 	lines := v.viewLines
 	loaded := v.loaded
@@ -1007,6 +997,7 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	keyRanges := v.searchKeyRanges
 	trigramEnabled := v.trigramEnabled
 	trigramIndex := v.trigramIndex
+	trigramPostings := v.trigramPostings
 	v.searchQuery = query
 	if len(v.viewLines) > 0 {
 		first := viewLineIndex(v.viewLines[0])
@@ -1060,7 +1051,7 @@ func (v *JSONMarkdownView) applySearchAsync(q string) {
 	}
 
 	if trigramEnabled && trigramIndex != nil && len(queryLower) >= 3 {
-		triCandidates := trigramCandidatesFromIndex(trigramIndex, queryLower)
+		triCandidates := trigramCandidatesFromIndex(trigramIndex, trigramPostings, queryLower)
 		if triCandidates != nil {
 			candidates = intersectSortedInts(candidates, triCandidates)
 		}
@@ -2150,6 +2141,240 @@ func containsFoldASCII(haystack []byte, needleLower []byte) bool {
 
 // --- Fold ranges & index
 
+type indexBundle struct {
+	buf              *JSONBuffer
+	foldRanges       map[int]int
+	foldDepths       map[int]int
+	keyRanges        map[string]keyRange
+	keyFold          map[string]int
+	searchIndex      map[string][]int
+	searchAll        []int
+	trigramIndex     map[[3]byte]trigramRange
+	trigramPostings  []int32
+	trigramEnabled   bool
+	trigramCapBytes  int
+	trigramUsedBytes int
+	lineNumWidth     int
+	topKeys          []string
+}
+
+type trigramRange struct {
+	offset int
+	length int
+}
+
+func buildIndexBundleFromBytes(data []byte) indexBundle {
+	bundle := indexBundle{}
+	if len(data) == 0 {
+		bundle.buf = &JSONBuffer{}
+		return bundle
+	}
+
+	estLines := len(data) / 80
+	if estLines < 1 {
+		estLines = 1
+	}
+	lineOffsets := make([]int, 0, estLines+1)
+	lineOffsets = append(lineOffsets, 0)
+	foldRanges := make(map[int]int, estLines/2+1)
+	foldDepths := make(map[int]int, estLines/2+1)
+	allLines := make([]int, 0, estLines)
+	keyRanges := make(map[string]keyRange, estLines/8+1)
+	keyFold := make(map[string]int, estLines/8+1)
+	keyStarts := make(map[string]int, estLines/8+1)
+	keyOrder := make([]int, 0, estLines/8+1)
+	keyNames := make([]string, 0, estLines/8+1)
+
+	capBytes := trigramCapBytes(len(data))
+	trigramEnabled := capBytes > 0
+	trigramUsed := 0
+	var trigramIndex map[[3]byte]trigramRange
+	postingsCap := capBytes / 4
+	if postingsCap < 1024 {
+		postingsCap = 1024
+	}
+	if postingsCap > len(data) {
+		postingsCap = len(data)
+	}
+	postings := make([]int32, 0, postingsCap)
+	if trigramEnabled {
+		trigramIndex = make(map[[3]byte]trigramRange, len(data)/64+1)
+	}
+
+	type foldEntry struct {
+		line  int
+		depth int
+	}
+	stack := make([]foldEntry, 0, 32)
+	depth := 0
+	inString := false
+	esc := false
+
+	lineStart := 0
+	lineNum := 0
+
+	finalizeLine := func(end int) {
+		lineEnd := end
+		if lineEnd > lineStart && data[lineEnd-1] == '\r' {
+			lineEnd--
+		}
+		line := data[lineStart:lineEnd]
+		allLines = append(allLines, lineNum)
+
+		if lineIndentDepthBytes(line) == 1 {
+			if key, ok := extractLineKeyBytes(line); ok {
+				if _, exists := keyStarts[key]; !exists {
+					keyStarts[key] = lineNum
+					keyOrder = append(keyOrder, lineNum)
+					keyNames = append(keyNames, key)
+				}
+			}
+		}
+
+		if trigramEnabled {
+			if len(line) >= 3 {
+				var seen map[[3]byte]struct{}
+				if len(line) > 64 {
+					seen = make(map[[3]byte]struct{}, 16)
+				}
+				for i := 0; i+2 < len(line); i++ {
+					tri := [3]byte{toLowerASCII(line[i]), toLowerASCII(line[i+1]), toLowerASCII(line[i+2])}
+					if seen != nil {
+						if _, ok := seen[tri]; ok {
+							continue
+						}
+						seen[tri] = struct{}{}
+					}
+					if r, ok := trigramIndex[tri]; ok {
+						postings = append(postings, int32(lineNum))
+						r.length++
+						trigramIndex[tri] = r
+						trigramUsed += 4
+					} else {
+						trigramIndex[tri] = trigramRange{offset: len(postings), length: 1}
+						postings = append(postings, int32(lineNum))
+						trigramUsed += 28
+					}
+					if trigramUsed > capBytes {
+						trigramIndex = nil
+						trigramEnabled = false
+						postings = nil
+						trigramUsed = 0
+						break
+					}
+				}
+			}
+		}
+	}
+
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+
+		if inString {
+			if esc {
+				esc = false
+				continue
+			}
+			if b == '\\' {
+				esc = true
+				continue
+			}
+			if b == '"' {
+				inString = false
+			}
+		} else {
+			if b == '"' {
+				inString = true
+			} else {
+				switch b {
+				case '{', '[':
+					stack = append(stack, foldEntry{line: lineNum, depth: depth})
+					depth++
+				case '}', ']':
+					if len(stack) > 0 {
+						depth--
+						open := stack[len(stack)-1]
+						stack = stack[:len(stack)-1]
+						if open.line < lineNum {
+							foldRanges[open.line] = lineNum
+							foldDepths[open.line] = open.depth
+						}
+					}
+				case '\n':
+					finalizeLine(i)
+					lineStart = i + 1
+					lineNum++
+					lineOffsets = append(lineOffsets, lineStart)
+				}
+			}
+		}
+	}
+	finalizeLine(len(data))
+
+	buf := &JSONBuffer{data: data, lineOffsets: lineOffsets}
+
+	lineCount := buf.LineCount()
+	for idx, start := range keyOrder {
+		if idx >= len(keyNames) {
+			break
+		}
+		key := keyNames[idx]
+		end := lineCount - 1
+		if idx+1 < len(keyOrder) {
+			end = keyOrder[idx+1] - 1
+		}
+		if end < start {
+			end = start
+		}
+		foldStart := -1
+		if _, ok := foldRanges[start]; ok {
+			foldStart = start
+		} else if start+1 <= end {
+			if _, ok := foldRanges[start+1]; ok {
+				foldStart = start + 1
+			}
+		}
+		if foldStart != -1 {
+			if foldEnd, ok := foldRanges[foldStart]; ok && foldEnd > end {
+				end = foldEnd
+			}
+			keyFold[key] = foldStart
+		}
+		keyRanges[key] = keyRange{start: start, end: end}
+	}
+
+	searchIndex := make(map[string][]int, len(keyRanges))
+	for key, rng := range keyRanges {
+		count := rng.end - rng.start + 1
+		if count < 0 {
+			continue
+		}
+		lines := make([]int, 0, count)
+		for i := rng.start; i <= rng.end && i < lineCount; i++ {
+			lines = append(lines, i)
+		}
+		searchIndex[key] = lines
+	}
+
+	bundle.buf = buf
+	bundle.foldRanges = foldRanges
+	bundle.foldDepths = foldDepths
+	bundle.keyRanges = keyRanges
+	bundle.keyFold = keyFold
+	bundle.searchIndex = searchIndex
+	bundle.searchAll = allLines
+	bundle.trigramIndex = trigramIndex
+	bundle.trigramPostings = postings
+	bundle.trigramEnabled = trigramEnabled
+	bundle.trigramCapBytes = capBytes
+	bundle.trigramUsedBytes = trigramUsed
+	bundle.lineNumWidth = len(strconv.Itoa(lineCount))
+	bundle.topKeys = topKeysFromRanges(keyRanges)
+	return bundle
+}
+
+// --- Helpers restored
+
 func collectTopLevelKeys(v any) []string {
 	root, ok := v.(map[string]any)
 	if !ok || len(root) == 0 {
@@ -2175,239 +2400,6 @@ func topKeysFromRanges(ranges map[string]keyRange) []string {
 	return keys
 }
 
-func buildSearchIndexBuffer(buf *JSONBuffer, foldRanges map[int]int) (map[string][]int, map[string]keyRange, []int, map[string]int) {
-	if buf == nil {
-		return nil, nil, nil, nil
-	}
-	index := make(map[string][]int)
-	keyStarts := make(map[string]int)
-	keyOrder := make([]int, 0)
-	keyRanges := make(map[string]keyRange)
-	keyFold := make(map[string]int)
-	lineCount := buf.LineCount()
-	allLines := make([]int, 0, lineCount)
-
-	for i := 0; i < lineCount; i++ {
-		line := buf.Line(i)
-		allLines = append(allLines, i)
-		if lineIndentDepthBytes(line) != 1 {
-			continue
-		}
-		if key, ok := extractLineKeyBytes(line); ok {
-			if _, exists := keyStarts[key]; !exists {
-				keyStarts[key] = i
-				keyOrder = append(keyOrder, i)
-			}
-		}
-	}
-	sort.Ints(keyOrder)
-
-	for idx, start := range keyOrder {
-		key := ""
-		for k, v := range keyStarts {
-			if v == start {
-				key = k
-				break
-			}
-		}
-		if key == "" {
-			continue
-		}
-		end := lineCount - 1
-		if idx+1 < len(keyOrder) {
-			end = keyOrder[idx+1] - 1
-		}
-		if end < start {
-			end = start
-		}
-		foldStart := -1
-		if _, ok := foldRanges[start]; ok {
-			foldStart = start
-		} else if start+1 <= end {
-			if _, ok := foldRanges[start+1]; ok {
-				foldStart = start + 1
-			}
-		}
-		if foldStart != -1 {
-			if foldEnd, ok := foldRanges[foldStart]; ok && foldEnd > end {
-				end = foldEnd
-			}
-			keyFold[key] = foldStart
-		}
-		keyRanges[key] = keyRange{start: start, end: end}
-		for i := start; i <= end && i < lineCount; i++ {
-			index[key] = append(index[key], i)
-		}
-	}
-	return index, keyRanges, allLines, keyFold
-}
-
-func lineIndentDepthBytes(line []byte) int {
-	count := 0
-	for _, b := range line {
-		if b != ' ' {
-			break
-		}
-		count++
-	}
-	return count / 2
-}
-
-func extractLineKeyBytes(line []byte) (string, bool) {
-	inString := false
-	esc := false
-	start := -1
-
-	for i, b := range line {
-		if inString {
-			if esc {
-				esc = false
-				continue
-			}
-			if b == '\\' {
-				esc = true
-				continue
-			}
-			if b == '"' {
-				keyBytes := line[start:i]
-				j := i + 1
-				for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
-					j++
-				}
-				if j < len(line) && line[j] == ':' {
-					key := string(keyBytes)
-					if unq, err := strconv.Unquote("\"" + key + "\""); err == nil {
-						return unq, true
-					}
-					return key, true
-				}
-				inString = false
-				continue
-			}
-			continue
-		}
-		if b == '"' {
-			inString = true
-			start = i + 1
-		}
-	}
-	return "", false
-}
-
-func buildFoldRangesWithDepthBuffer(buf *JSONBuffer) (map[int]int, map[int]int) {
-	ranges := map[int]int{}
-	depths := map[int]int{}
-	if buf == nil {
-		return ranges, depths
-	}
-	type entry struct {
-		line  int
-		brace rune
-		depth int
-	}
-	stack := make([]entry, 0, 32)
-	depth := 0
-	lineCount := buf.LineCount()
-
-	for i := 0; i < lineCount; i++ {
-		line := buf.Line(i)
-		inString := false
-		esc := false
-		for _, b := range line {
-			if inString {
-				if esc {
-					esc = false
-					continue
-				}
-				if b == '\\' {
-					esc = true
-					continue
-				}
-				if b == '"' {
-					inString = false
-				}
-				continue
-			}
-			if b == '"' {
-				inString = true
-				continue
-			}
-			switch b {
-			case '{', '[':
-				stack = append(stack, entry{line: i, brace: rune(b), depth: depth})
-				depth++
-			case '}', ']':
-				if len(stack) == 0 {
-					continue
-				}
-				depth--
-				open := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				if open.line < i {
-					ranges[open.line] = i
-					depths[open.line] = open.depth
-				}
-			}
-		}
-	}
-	return ranges, depths
-}
-
-// --- Trigram index
-
-func (v *JSONMarkdownView) buildTrigramIndexLocked(buf *JSONBuffer, dataSize int) {
-	v.trigramIndex = nil
-	v.trigramEnabled = false
-	v.trigramUsedBytes = 0
-	v.trigramCapBytes = trigramCapBytes(dataSize)
-	if v.trigramCapBytes <= 0 || buf == nil {
-		return
-	}
-
-	idx := make(map[[3]byte][]int32)
-	used := 0
-	capBytes := v.trigramCapBytes
-	lineCount := buf.LineCount()
-
-	for lineIdx := 0; lineIdx < lineCount; lineIdx++ {
-		line := buf.Line(lineIdx)
-		if len(line) < 3 {
-			continue
-		}
-		var seen map[[3]byte]struct{}
-		if len(line) > 64 {
-			seen = make(map[[3]byte]struct{}, 16)
-		}
-		for i := 0; i+2 < len(line); i++ {
-			tri := [3]byte{toLowerASCII(line[i]), toLowerASCII(line[i+1]), toLowerASCII(line[i+2])}
-			if seen != nil {
-				if _, ok := seen[tri]; ok {
-					continue
-				}
-				seen[tri] = struct{}{}
-			}
-			lst, ok := idx[tri]
-			if !ok {
-				lst = make([]int32, 0, 4)
-				idx[tri] = lst
-				used += 24
-			}
-			idx[tri] = append(lst, int32(lineIdx))
-			used += 4
-			if used > capBytes {
-				v.trigramIndex = nil
-				v.trigramEnabled = false
-				v.trigramUsedBytes = 0
-				return
-			}
-		}
-	}
-
-	v.trigramIndex = idx
-	v.trigramEnabled = true
-	v.trigramUsedBytes = used
-}
-
 func trigramCapBytes(dataSize int) int {
 	if dataSize <= 0 {
 		return 0
@@ -2422,7 +2414,7 @@ func trigramCapBytes(dataSize int) int {
 	return capBytes
 }
 
-func trigramCandidatesFromIndex(idx map[[3]byte][]int32, queryLower []byte) []int {
+func trigramCandidatesFromIndex(idx map[[3]byte]trigramRange, postings []int32, queryLower []byte) []int {
 	if idx == nil || len(queryLower) < 3 {
 		return nil
 	}
@@ -2432,11 +2424,14 @@ func trigramCandidatesFromIndex(idx map[[3]byte][]int32, queryLower []byte) []in
 	}
 	lists := make([][]int32, 0, len(trigrams))
 	for _, tri := range trigrams {
-		lst, ok := idx[tri]
-		if !ok || len(lst) == 0 {
+		r, ok := idx[tri]
+		if !ok || r.length == 0 {
 			return []int{}
 		}
-		lists = append(lists, lst)
+		if r.offset < 0 || r.offset+r.length > len(postings) {
+			return []int{}
+		}
+		lists = append(lists, postings[r.offset:r.offset+r.length])
 	}
 	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
 	base := append([]int32(nil), lists[0]...)
@@ -2523,7 +2518,57 @@ func toLowerASCII(b byte) byte {
 	return b
 }
 
-// --- Misc
+func lineIndentDepthBytes(line []byte) int {
+	count := 0
+	for _, b := range line {
+		if b != ' ' {
+			break
+		}
+		count++
+	}
+	return count / 2
+}
+
+func extractLineKeyBytes(line []byte) (string, bool) {
+	inString := false
+	esc := false
+	start := -1
+
+	for i, b := range line {
+		if inString {
+			if esc {
+				esc = false
+				continue
+			}
+			if b == '\\' {
+				esc = true
+				continue
+			}
+			if b == '"' {
+				keyBytes := line[start:i]
+				j := i + 1
+				for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+					j++
+				}
+				if j < len(line) && line[j] == ':' {
+					key := string(keyBytes)
+					if unq, err := strconv.Unquote("\"" + key + "\""); err == nil {
+						return unq, true
+					}
+					return key, true
+				}
+				inString = false
+				continue
+			}
+			continue
+		}
+		if b == '"' {
+			inString = true
+			start = i + 1
+		}
+	}
+	return "", false
+}
 
 func highlightColor() color.Color {
 	bg := theme.BackgroundColor()
