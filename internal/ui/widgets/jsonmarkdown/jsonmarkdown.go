@@ -3,6 +3,7 @@
 package jsonmarkdown
 
 import (
+	"bytes"
 	"fmt"
 	"image/color"
 	"sort"
@@ -341,28 +342,32 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 		return
 	}
 
-	var parsed any
-	pretty := s
 	data := []byte(s)
+	prettyBytes := data
+	var parsed any
+	parsedOK := false
+
 	if sonic.Valid(data) {
-		if err := sonic.Unmarshal(data, &parsed); err == nil {
-			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
-				pretty = string(b)
-			}
-		}
-		if !strings.Contains(pretty, "\n") && parsed != nil {
-			if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
-				pretty = string(b)
+		needsPretty := !bytes.Contains(data, []byte("\n"))
+		if needsPretty {
+			if err := sonic.Unmarshal(data, &parsed); err == nil {
+				parsedOK = true
+				if b, err := sonic.MarshalIndent(parsed, "", "  "); err == nil {
+					prettyBytes = b
+				}
 			}
 		}
 	}
 
-	buf := newJSONBuffer(pretty)
+	buf := newJSONBufferFromBytes(prettyBytes)
 	foldRanges, foldDepths := buildFoldRangesWithDepthBuffer(buf)
-	topKeys := collectTopLevelKeys(parsed)
 	index, keyRanges, allLines, keyFold := buildSearchIndexBuffer(buf, foldRanges)
-	lineCount := buf.LineCount()
-	lineNumWidth := len(strconv.Itoa(lineCount))
+	lineNumWidth := len(strconv.Itoa(buf.LineCount()))
+
+	topKeys := topKeysFromRanges(keyRanges)
+	if parsedOK {
+		topKeys = collectTopLevelKeys(parsed)
+	}
 
 	v.mu.Lock()
 	v.fullBuf = buf
@@ -378,7 +383,7 @@ func (v *JSONMarkdownView) SetJSON(s string) {
 	v.searchKeyRanges = keyRanges
 	v.searchKeyFold = keyFold
 	v.lineNumWidth = lineNumWidth
-	v.buildTrigramIndexLocked(buf, len(pretty))
+	v.buildTrigramIndexLocked(buf, len(prettyBytes))
 	v.rebuildViewLinesLocked()
 	v.mu.Unlock()
 
@@ -1402,11 +1407,15 @@ type JSONBuffer struct {
 }
 
 func newJSONBuffer(s string) *JSONBuffer {
+	return newJSONBufferFromBytes([]byte(s))
+}
+
+func newJSONBufferFromBytes(data []byte) *JSONBuffer {
 	b := &JSONBuffer{}
-	if s == "" {
+	if len(data) == 0 {
 		return b
 	}
-	b.data = []byte(s)
+	b.data = data
 	b.lineOffsets = buildLineOffsets(b.data)
 	return b
 }
@@ -2139,6 +2148,18 @@ func collectTopLevelKeys(v any) []string {
 	}
 	keys := make([]string, 0, len(root))
 	for k := range root {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func topKeysFromRanges(ranges map[string]keyRange) []string {
+	if len(ranges) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(ranges))
+	for k := range ranges {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
