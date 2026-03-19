@@ -1,4 +1,4 @@
-package jsonmarkdown
+package jsonviewer
 
 import (
 	"runtime"
@@ -35,7 +35,7 @@ func makeLargeJSON(targetBytes int) string {
 	return sb.String()
 }
 
-func newTestView() *JSONMarkdownView {
+func newTestView() *JSONView {
 	app := test.NewApp()
 	win := test.NewWindow(nil)
 	win.SetOnClosed(func() {})
@@ -44,7 +44,7 @@ func newTestView() *JSONMarkdownView {
 	return v
 }
 
-func waitForSearch(v *JSONMarkdownView, query string, timeout time.Duration) {
+func waitForSearch(v *JSONView, query string, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for {
 		v.mu.Lock()

@@ -1,4 +1,4 @@
-package jsonmarkdown
+package jsonviewer
 
 import (
 	"bytes"

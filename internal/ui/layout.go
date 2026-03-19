@@ -23,8 +23,8 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/bytedance/sonic"
-	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsonmarkdown"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsontree"
+	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsonviewer"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/protopicker"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 
@@ -172,7 +172,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 
 	// Output widget (JSON tree + markdown)
 	jsonTree := jsontree.NewSearchableJSONTree()
-	jsonMarkdown := jsonmarkdown.NewJSONMarkdownView(w)
+	jsonMarkdown := jsonviewer.NewJSONMarkdownView(w)
 
 	_ = jsonTree.View()
 	outMarkdown := jsonMarkdown.View()
