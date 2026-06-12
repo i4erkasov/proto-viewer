@@ -13,11 +13,10 @@ import (
 	"github.com/bytedance/sonic"
 )
 
-// SetJSON resets content and loads the first chunk.
+// SetJSON resets content and renders the first viewport.
 func (v *JSONView) SetJSON(s string) {
 	v.mu.Lock()
-	v.loaded = 0
-	v.loading = false
+	v.winStart = 0
 	v.folded = map[int]bool{}
 	v.matchLines = nil
 	v.matchIndex = -1
@@ -44,7 +43,13 @@ func (v *JSONView) SetJSON(s string) {
 	v.SetSearchVisible(false)
 
 	if strings.TrimSpace(s) == "" {
-		v.setGrid(nil)
+		v.mu.Lock()
+		v.fullBuf = nil
+		v.viewLines = v.viewLines[:0]
+		v.contentW = 0
+		v.mu.Unlock()
+		v.resetScroll()
+		v.updateWindow()
 		v.setSearchKeys(nil)
 		return
 	}
@@ -81,64 +86,12 @@ func (v *JSONView) SetJSON(s string) {
 	v.trigramCapBytes = bundle.trigramCapBytes
 	v.trigramUsedBytes = bundle.trigramUsedBytes
 	v.rebuildViewLinesLocked()
+	v.recomputeContentWidthLocked()
 	v.mu.Unlock()
 
 	v.setSearchKeys(bundle.topKeys)
-	v.loadMore()
-}
-
-func (v *JSONView) tryLoadMore() {
-	v.mu.Lock()
-	if v.loading {
-		v.mu.Unlock()
-		return
-	}
-	v.loading = true
-	v.mu.Unlock()
-
-	fyne.Do(func() {
-		v.mu.Lock()
-		v.loading = false
-		v.mu.Unlock()
-
-		if v.scroll.Content == nil {
-			return
-		}
-		if v.scroll.Offset.Y+v.scroll.Size().Height < v.scroll.Content.Size().Height-scrollThreshold {
-			return
-		}
-		v.loadMore()
-	})
-}
-
-func (v *JSONView) loadMore() {
-	v.mu.Lock()
-	if len(v.viewLines) == 0 {
-		v.mu.Unlock()
-		v.setGrid(nil)
-		return
-	}
-	if v.loaded >= len(v.viewLines) {
-		v.mu.Unlock()
-		return
-	}
-	start := v.loaded
-	end := v.loaded + v.chunk
-	if end > len(v.viewLines) {
-		end = len(v.viewLines)
-	}
-	newLines := make([]int, end-start)
-	copy(newLines, v.viewLines[start:end])
-	v.loaded = end
-	v.mu.Unlock()
-
-	// First chunk replaces any stale rows from previous content; subsequent
-	// chunks are appended so already-rendered lines are not rebuilt.
-	if start == 0 {
-		v.setGrid(newLines)
-	} else {
-		v.appendGrid(newLines)
-	}
+	v.resetScroll()
+	v.updateWindow()
 }
 
 func (v *JSONView) applyKeyFilter(key string) {
@@ -159,16 +112,9 @@ func (v *JSONView) applyKeyFilterKeys(keys []string) {
 			v.rebuildViewLinesForKeysLocked(keys)
 		}
 	}
-	v.loaded = minInt(v.chunk, len(v.viewLines))
-	lines := v.viewLines
-	loaded := v.loaded
 	v.mu.Unlock()
 
-	if loaded > 0 {
-		v.setGrid(lines[:loaded])
-	} else {
-		v.setGrid(nil)
-	}
+	v.updateWindow()
 }
 
 func (v *JSONView) rebuildViewLinesForKeysLocked(keys []string) {

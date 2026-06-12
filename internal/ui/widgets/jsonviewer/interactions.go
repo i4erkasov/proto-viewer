@@ -23,6 +23,9 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 	}
 
 	v.mu.Lock()
+	// TextGrid содержит только видимое окно, поэтому строка тапа — локальная;
+	// добавляем смещение окна, чтобы получить индекс в полном viewLines.
+	row += v.winStart
 	if row >= len(v.viewLines) {
 		v.mu.Unlock()
 		return
@@ -64,7 +67,6 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 		return
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
-	justUnfolded := !v.folded[srcLine]
 	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
 		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
 	} else if len(v.searchKeys) > 0 {
@@ -72,43 +74,11 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 	} else {
 		v.rebuildViewLinesLocked()
 	}
-	if v.loaded > len(v.viewLines) {
-		v.loaded = len(v.viewLines)
-	}
-	if v.loaded == 0 && len(v.viewLines) > 0 {
-		v.loaded = minInt(v.chunk, len(v.viewLines))
-	}
-	// When unfolding, the revealed lines may sit past the currently loaded
-	// range. If they fit within the viewport there are no scroll events to
-	// trigger lazy loading, so the expanded content would be unreachable.
-	// Extend loaded to one chunk past the unfold point: this makes the content
-	// taller than the viewport (so it stays scrollable) while still lazily
-	// streaming the rest of a large block on scroll instead of rendering it all.
-	if justUnfolded {
-		for i, vl := range v.viewLines {
-			if viewLineIndex(vl) == srcLine {
-				target := i + 1 + v.chunk
-				if target > len(v.viewLines) {
-					target = len(v.viewLines)
-				}
-				if target > v.loaded {
-					v.loaded = target
-				}
-				break
-			}
-		}
-	}
-	lines := v.viewLines
-	loaded := v.loaded
-	offset := v.scroll.Offset
 	v.mu.Unlock()
 
-	v.setGrid(lines[:loaded])
-	fyne.Do(func() {
-		if v.scroll != nil {
-			v.scroll.ScrollToOffset(offset)
-		}
-	})
+	// Виртуализация: общая высота контента пересчитывается из нового viewLines,
+	// текущая позиция прокрутки сохраняется, перерисовываем видимое окно.
+	v.updateWindow()
 }
 
 func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
@@ -121,6 +91,7 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 	}
 
 	v.mu.Lock()
+	row += v.winStart
 	if row >= len(v.viewLines) {
 		v.mu.Unlock()
 		return

@@ -77,15 +77,9 @@ func (v *JSONView) applySearchAsync(q string) {
 			v.matchLines = nil
 			v.searchMatchSet = nil
 			v.matchIndex = -1
-			lines := v.viewLines
-			loaded := v.loaded
 			v.mu.Unlock()
 			v.updateNavButtons()
-			if loaded > 0 {
-				v.setGrid(lines[:loaded])
-			} else {
-				v.setGrid(nil)
-			}
+			v.updateWindow()
 		})
 		return
 	}
@@ -144,17 +138,10 @@ func (v *JSONView) applySearchAsync(q string) {
 			} else if v.matchIndex < 0 || v.matchIndex >= len(matchLines) {
 				v.matchIndex = 0
 			}
-			v.loaded = minInt(v.chunk, len(v.viewLines))
-			lines := v.viewLines
-			loaded := v.loaded
 			v.mu.Unlock()
 
 			v.updateNavButtons()
-			if loaded > 0 {
-				v.setGrid(lines[:loaded])
-			} else {
-				v.setGrid(nil)
-			}
+			v.updateWindow()
 		})
 	}(seq, queryLower, candidates)
 }
@@ -196,16 +183,6 @@ func (v *JSONView) expandForLineLocked(line int) bool {
 	return changed
 }
 
-func (v *JSONView) ensureLoadedForRowLocked(row int) {
-	if row < 0 {
-		return
-	}
-	target := row + 1 + v.chunk
-	if target > v.loaded {
-		v.loaded = minInt(target, len(v.viewLines))
-	}
-}
-
 func (v *JSONView) navigateMatch(step int) {
 	v.mu.Lock()
 	if len(v.matchLines) == 0 {
@@ -228,13 +205,9 @@ func (v *JSONView) navigateMatch(step int) {
 		v.rebuildViewLinesForKeysLocked(v.searchKeys)
 	}
 	row := findViewRow(v.viewLines, line)
-	v.ensureLoadedForRowLocked(row)
-	lines := v.viewLines
-	loaded := v.loaded
 	v.mu.Unlock()
 
-	v.setGrid(lines[:loaded])
-	v.scrollToRow(row)
+	v.scrollToViewRow(row)
 }
 
 func (v *JSONView) updateNavButtons() {
@@ -248,18 +221,6 @@ func (v *JSONView) updateNavButtons() {
 	}
 	v.searchUp.Enable()
 	v.searchDown.Enable()
-}
-
-func (v *JSONView) scrollToRow(row int) {
-	if v.scroll == nil || v.tgrid == nil || row < 0 {
-		return
-	}
-	rows := len(v.tgrid.Rows)
-	if rows == 0 {
-		return
-	}
-	rowH := v.tgrid.MinSize().Height / float32(rows)
-	v.scroll.ScrollToOffset(fyne.NewPos(0, rowH*float32(row)))
 }
 
 // --- Search helpers

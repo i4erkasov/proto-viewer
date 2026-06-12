@@ -91,23 +91,27 @@ func BenchmarkSearch_5MB(b *testing.B) {
 	}
 }
 
-func BenchmarkSetGrid_Chunk_5MB(b *testing.B) {
+func benchWindow(v *JSONView) []int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	n := len(v.viewLines)
+	count := 2*overscan + 60
+	if count > n {
+		count = n
+	}
+	return append([]int(nil), v.viewLines[:count]...)
+}
+
+func BenchmarkBuildWindow_5MB(b *testing.B) {
 	v := newTestView()
 	json := makeLargeJSON(5 << 20)
 	v.SetJSON(json)
-	v.mu.Lock()
-	end := v.loaded
-	if end == 0 {
-		end = minInt(v.chunk, len(v.viewLines))
-		v.loaded = end
-	}
-	lines := append([]int(nil), v.viewLines[:end]...)
-	v.mu.Unlock()
+	window := benchWindow(v)
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		v.setGrid(lines)
+		_ = v.buildRowsForView(window)
 	}
 }
 
@@ -133,10 +137,13 @@ func BenchmarkFoldUnfold_5MB(b *testing.B) {
 		v.mu.Lock()
 		v.folded[foldStart] = !v.folded[foldStart]
 		v.rebuildViewLinesLocked()
-		end := minInt(v.chunk, len(v.viewLines))
-		lines := append([]int(nil), v.viewLines[:end]...)
-		v.loaded = end
+		n := len(v.viewLines)
+		count := 2*overscan + 60
+		if count > n {
+			count = n
+		}
+		window := append([]int(nil), v.viewLines[:count]...)
 		v.mu.Unlock()
-		v.setGrid(lines)
+		_ = v.buildRowsForView(window)
 	}
 }

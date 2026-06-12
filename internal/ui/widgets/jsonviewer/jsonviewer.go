@@ -3,13 +3,11 @@
 package jsonviewer
 
 import (
-	"image/color"
 	"strings"
 	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
@@ -17,19 +15,18 @@ import (
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 )
 
-const (
-	defaultChunkLines = 200
-	scrollThreshold   = 12
-	searchKeyPrompt   = "Select key"
-)
+const searchKeyPrompt = "Select key"
 
-// JSONView renders JSON as markdown with lazy line loading.
+// JSONView renders JSON as a virtualized, syntax-highlighted grid.
 type JSONView struct {
 	mu        sync.Mutex
 	viewLines []int
-	loaded    int
-	chunk     int
-	loading   bool
+
+	// Виртуализация вьюпорта: рендерим только видимое окно строк.
+	winStart int     // индекс первой строки текущего окна в viewLines
+	lineH    float32 // высота одной строки (метрика TextGrid)
+	cellW    float32 // ширина одного символа (моноширинный шрифт)
+	contentW float32 // полная ширина контента для горизонтального скролла
 
 	foldRanges map[int]int
 	folded     map[int]bool
@@ -37,6 +34,7 @@ type JSONView struct {
 	tgrid   *widget.TextGrid
 	overlay *tapOverlay
 	scroll  *container.Scroll
+	content *fyne.Container
 	win     fyne.Window
 
 	fullBuf *JSONBuffer
@@ -98,19 +96,20 @@ type keyRange struct {
 
 // NewJSONMarkdownView creates a markdown view with lazy loading.
 func NewJSONMarkdownView(win fyne.Window) *JSONView {
-	v := &JSONView{chunk: defaultChunkLines}
+	v := &JSONView{}
 	v.selectedKeyLine = -1
 	v.selectedValueLine = -1
 	v.win = win
 	v.tgrid = widget.NewTextGrid()
 	v.overlay = newTapOverlay(v.handleTap, v.handleSecondaryTap)
-	// styles applied per cell
-	padTop := canvas.NewRectangle(color.Transparent)
-	padTop.SetMinSize(fyne.NewSize(1, theme.Padding()))
-	content := container.NewBorder(padTop, nil, nil, nil, container.NewMax(v.tgrid, v.overlay))
-	v.scroll = container.NewScroll(content)
+	v.probeMetrics()
+	// Кастомный layout имитирует полную высоту контента, а в TextGrid лежит
+	// только видимое окно строк (виртуализация вьюпорта).
+	gridStack := container.NewStack(v.tgrid, v.overlay)
+	v.content = container.New(&gridWindowLayout{v: v}, gridStack)
+	v.scroll = container.NewScroll(v.content)
 	v.scroll.OnScrolled = func(_ fyne.Position) {
-		v.tryLoadMore()
+		v.onScroll()
 	}
 
 	v.searchEntry = newEscEntry()

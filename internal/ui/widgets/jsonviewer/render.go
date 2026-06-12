@@ -13,8 +13,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-
-	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
 )
 
 // --- JSON color palette (matches tree colors)
@@ -563,42 +561,4 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 		}
 	}
 	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange)
-}
-
-// setGrid replaces the whole grid content with the given view lines.
-func (v *JSONView) setGrid(viewLines []int) {
-	fyne.Do(func() {
-		if v.tgrid == nil {
-			return
-		}
-		stopBuild := perf.Track(fmt.Sprintf("setGrid build (%d lines)", len(viewLines)))
-		v.tgrid.Rows = v.buildRowsForView(viewLines)
-		stopBuild()
-		stopRefresh := perf.Track(fmt.Sprintf("setGrid refresh (%d rows)", len(v.tgrid.Rows)))
-		v.tgrid.Refresh()
-		v.scroll.Refresh()
-		stopRefresh()
-	})
-}
-
-// appendGrid appends rows for newly loaded view lines without rebuilding the
-// rows for already-loaded lines. This keeps incremental scrolling O(new lines)
-// on the Go side instead of O(all loaded lines).
-func (v *JSONView) appendGrid(newViewLines []int) {
-	if len(newViewLines) == 0 {
-		return
-	}
-	fyne.Do(func() {
-		if v.tgrid == nil {
-			return
-		}
-		stopBuild := perf.Track(fmt.Sprintf("appendGrid build (%d lines)", len(newViewLines)))
-		rows := v.buildRowsForView(newViewLines)
-		v.tgrid.Rows = append(v.tgrid.Rows, rows...)
-		stopBuild()
-		stopRefresh := perf.Track(fmt.Sprintf("appendGrid refresh (%d rows total)", len(v.tgrid.Rows)))
-		v.tgrid.Refresh()
-		v.scroll.Refresh()
-		stopRefresh()
-	})
 }

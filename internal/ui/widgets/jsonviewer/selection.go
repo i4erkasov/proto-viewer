@@ -47,15 +47,7 @@ func (v *JSONView) clearSelectedValue() {
 }
 
 func (v *JSONView) refreshSelection() {
-	v.mu.Lock()
-	lines := v.viewLines
-	loaded := v.loaded
-	v.mu.Unlock()
-	if loaded > 0 {
-		v.setGrid(lines[:loaded])
-	} else {
-		v.setGrid(nil)
-	}
+	v.updateWindow()
 }
 
 func (v *JSONView) SelectedKeyValueString() string {
