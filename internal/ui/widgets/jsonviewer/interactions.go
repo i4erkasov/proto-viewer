@@ -64,6 +64,7 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 		return
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
+	justUnfolded := !v.folded[srcLine]
 	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
 		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
 	} else if len(v.searchKeys) > 0 {
@@ -76,6 +77,26 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 	}
 	if v.loaded == 0 && len(v.viewLines) > 0 {
 		v.loaded = minInt(v.chunk, len(v.viewLines))
+	}
+	// When unfolding, the revealed lines may sit past the currently loaded
+	// range. If they fit within the viewport there are no scroll events to
+	// trigger lazy loading, so the expanded content would be unreachable.
+	// Extend loaded to one chunk past the unfold point: this makes the content
+	// taller than the viewport (so it stays scrollable) while still lazily
+	// streaming the rest of a large block on scroll instead of rendering it all.
+	if justUnfolded {
+		for i, vl := range v.viewLines {
+			if viewLineIndex(vl) == srcLine {
+				target := i + 1 + v.chunk
+				if target > len(v.viewLines) {
+					target = len(v.viewLines)
+				}
+				if target > v.loaded {
+					v.loaded = target
+				}
+				break
+			}
+		}
 	}
 	lines := v.viewLines
 	loaded := v.loaded

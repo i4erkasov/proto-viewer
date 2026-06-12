@@ -29,6 +29,7 @@ import (
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 
 	"github.com/i4erkasov/proto-viewer/internal/domain"
+	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/protoutil"
 	"github.com/i4erkasov/proto-viewer/internal/service/cache"
 	"github.com/i4erkasov/proto-viewer/internal/ui/tab"
@@ -901,6 +902,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				}
 			}
 
+			stopDecode := perf.Track("Decoder.Decode")
 			res, err := dec.Decode(ctx, domain.DecodeRequest{
 				ProtoRoot: root,
 				ProtoFile: protoAbs,
@@ -909,6 +911,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				Format:    domain.OutputFormatJSON,
 				Bytes:     payload,
 			})
+			stopDecode()
 			if err != nil {
 				fyne.Do(func() {
 					lblStatus.SetText("Status: error")
@@ -917,16 +920,10 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				return
 			}
 
-			// For large JSON skip pretty printing (it can be slow)
+			// decodeJSON already returns 2-space indented JSON, so no extra
+			// pretty-printing pass is needed here (it only added a full
+			// parse+marshal of up to 512KB on every decode).
 			jsonText := res.Raw
-			if len(jsonText) <= 512_000 {
-				var v any
-				if err := sonic.Unmarshal([]byte(jsonText), &v); err == nil {
-					if pretty, err := sonic.MarshalIndent(v, "", "  "); err == nil {
-						jsonText = string(pretty)
-					}
-				}
-			}
 
 			// Cache only for File tab
 			cachedPath := ""

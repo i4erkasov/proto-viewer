@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // This package is responsible for ensuring protoc binary exists on the local machine.
@@ -28,14 +29,26 @@ func windowsZipBytes() ([]byte, error) {
 	return embeddedFS.ReadFile("protoc_windows_amd64.zip")
 }
 
+var (
+	ensureOnce sync.Once
+	ensurePath string
+	ensureErr  error
+)
+
+// Ensure resolves the protoc binary path once and memoizes the result.
+// On Windows the embedded zip is hashed and unpacked only on the first call;
+// subsequent calls return the cached path without re-hashing the archive.
 func Ensure() (string, error) {
-	switch runtime.GOOS {
-	case "windows":
-		return ensureWindows()
-	default:
-		// On non-windows: rely on PATH.
-		return "protoc", nil
-	}
+	ensureOnce.Do(func() {
+		switch runtime.GOOS {
+		case "windows":
+			ensurePath, ensureErr = ensureWindows()
+		default:
+			// On non-windows: rely on PATH.
+			ensurePath = "protoc"
+		}
+	})
+	return ensurePath, ensureErr
 }
 
 func ensureWindows() (string, error) {

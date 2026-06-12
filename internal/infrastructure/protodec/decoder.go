@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/dynamicpb"
 
 	"github.com/i4erkasov/proto-viewer/internal/domain"
+	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/protocbin"
 )
 
@@ -82,10 +83,13 @@ func compileDescriptorSet(ctx context.Context, protoRoot, protoAbs string) (*des
 	hideWindow(cmd)
 	var errBuf bytes.Buffer
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
+	stopProtoc := perf.Track("protoc descriptor_set (" + relProto + ")")
+	runErr := cmd.Run()
+	stopProtoc()
+	if runErr != nil {
 		stderr := strings.TrimSpace(errBuf.String())
 		if stderr == "" {
-			stderr = err.Error()
+			stderr = runErr.Error()
 		}
 		return nil, fmt.Errorf("%s", stderr)
 	}

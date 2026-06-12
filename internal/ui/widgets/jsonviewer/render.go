@@ -7,11 +7,14 @@ import (
 	"image/color"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
 )
 
 // --- JSON color palette (matches tree colors)
@@ -110,6 +113,35 @@ func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]high
 	return rows
 }
 
+// styleKey identifies a unique cell style. color.Color values produced here
+// are always comparable structs (color.NRGBA / resolved theme colors), so they
+// are safe to use as map keys.
+type styleKey struct {
+	fg   color.Color
+	bg   color.Color
+	bold bool
+}
+
+var (
+	styleCacheMu sync.Mutex
+	styleCache   = make(map[styleKey]*widget.CustomTextGridStyle)
+)
+
+// cellStyle returns a shared *CustomTextGridStyle for the given attributes.
+// The renderer treats styles as read-only, so sharing pointers across cells is
+// safe and avoids one heap allocation per character.
+func cellStyle(fg, bg color.Color, bold bool) *widget.CustomTextGridStyle {
+	k := styleKey{fg: fg, bg: bg, bold: bold}
+	styleCacheMu.Lock()
+	s, ok := styleCache[k]
+	if !ok {
+		s = &widget.CustomTextGridStyle{FGColor: fg, BGColor: bg, TextStyle: fyne.TextStyle{Bold: bold}}
+		styleCache[k] = s
+	}
+	styleCacheMu.Unlock()
+	return s
+}
+
 func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange) []widget.TextGridCell {
 	if len(line) == 0 {
 		return nil
@@ -117,6 +149,9 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 	cells := make([]widget.TextGridCell, 0, len(line))
 	pending := make([]byte, 0, 32)
 	pendingColor := theme.ForegroundColor()
+	// Resolve theme-dependent colors once per line instead of per byte.
+	hlBg := highlightColor()
+	lnBg := lineNumberBgColor()
 	rangeIndex := 0
 	pos := 0
 
@@ -148,17 +183,19 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 			return
 		}
 		for _, b := range pending {
-			style := &widget.CustomTextGridStyle{FGColor: pendingColor}
-			if inHighlight(pos) {
-				style.BGColor = highlightColor()
-			}
-			if inSelected(pos) {
-				style.TextStyle = fyne.TextStyle{Bold: true}
-			}
+			var bg color.Color
+			bold := false
 			if pos < prefixLen {
-				style.BGColor = lineNumberBgColor()
+				bg = lnBg
+			} else {
+				if inHighlight(pos) {
+					bg = hlBg
+				}
+				if inSelected(pos) {
+					bold = true
+				}
 			}
-			cells = append(cells, widget.TextGridCell{Rune: rune(b), Style: style})
+			cells = append(cells, widget.TextGridCell{Rune: rune(b), Style: cellStyle(pendingColor, bg, bold)})
 			pos++
 		}
 		pending = pending[:0]
@@ -501,34 +538,67 @@ func intersectSortedInts(a, b []int) []int {
 	return out
 }
 
+// buildRowsForView builds TextGrid rows for the given view lines, applying the
+// current search highlights and selection. Safe to call off the UI thread.
+func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
+	v.mu.Lock()
+	query := strings.TrimSpace(v.searchQuery)
+	matchSet := v.searchMatchSet
+	lineNumWidth := v.lineNumWidth
+	selectedLine := v.selectedKeyLine
+	selectedRange := v.selectedKeyRange
+	if v.selectedValueLine >= 0 {
+		selectedLine = v.selectedValueLine
+		selectedRange = v.selectedValueRange
+	}
+	buf := v.fullBuf
+	v.mu.Unlock()
+
+	lineBytes, srcLines, placeholders := buildViewLineBytes(buf, viewLines)
+	var highlights map[int][]highlightRange
+	if query != "" && matchSet != nil {
+		queryLower := asciiLowerBytes([]byte(query))
+		if len(queryLower) > 0 {
+			highlights = buildVisibleHighlightsBytes(lineBytes, srcLines, placeholders, queryLower, matchSet)
+		}
+	}
+	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange)
+}
+
+// setGrid replaces the whole grid content with the given view lines.
 func (v *JSONView) setGrid(viewLines []int) {
 	fyne.Do(func() {
 		if v.tgrid == nil {
 			return
 		}
-		v.mu.Lock()
-		query := strings.TrimSpace(v.searchQuery)
-		matchSet := v.searchMatchSet
-		lineNumWidth := v.lineNumWidth
-		selectedLine := v.selectedKeyLine
-		selectedRange := v.selectedKeyRange
-		if v.selectedValueLine >= 0 {
-			selectedLine = v.selectedValueLine
-			selectedRange = v.selectedValueRange
-		}
-		buf := v.fullBuf
-		v.mu.Unlock()
-
-		lineBytes, srcLines, placeholders := buildViewLineBytes(buf, viewLines)
-		var highlights map[int][]highlightRange
-		if query != "" && matchSet != nil {
-			queryLower := asciiLowerBytes([]byte(query))
-			if len(queryLower) > 0 {
-				highlights = buildVisibleHighlightsBytes(lineBytes, srcLines, placeholders, queryLower, matchSet)
-			}
-		}
-		v.tgrid.Rows = buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange)
+		stopBuild := perf.Track(fmt.Sprintf("setGrid build (%d lines)", len(viewLines)))
+		v.tgrid.Rows = v.buildRowsForView(viewLines)
+		stopBuild()
+		stopRefresh := perf.Track(fmt.Sprintf("setGrid refresh (%d rows)", len(v.tgrid.Rows)))
 		v.tgrid.Refresh()
 		v.scroll.Refresh()
+		stopRefresh()
+	})
+}
+
+// appendGrid appends rows for newly loaded view lines without rebuilding the
+// rows for already-loaded lines. This keeps incremental scrolling O(new lines)
+// on the Go side instead of O(all loaded lines).
+func (v *JSONView) appendGrid(newViewLines []int) {
+	if len(newViewLines) == 0 {
+		return
+	}
+	fyne.Do(func() {
+		if v.tgrid == nil {
+			return
+		}
+		stopBuild := perf.Track(fmt.Sprintf("appendGrid build (%d lines)", len(newViewLines)))
+		rows := v.buildRowsForView(newViewLines)
+		v.tgrid.Rows = append(v.tgrid.Rows, rows...)
+		stopBuild()
+		stopRefresh := perf.Track(fmt.Sprintf("appendGrid refresh (%d rows total)", len(v.tgrid.Rows)))
+		v.tgrid.Refresh()
+		v.scroll.Refresh()
+		stopRefresh()
 	})
 }

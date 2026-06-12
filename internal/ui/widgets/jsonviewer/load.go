@@ -122,16 +122,23 @@ func (v *JSONView) loadMore() {
 		v.mu.Unlock()
 		return
 	}
+	start := v.loaded
 	end := v.loaded + v.chunk
 	if end > len(v.viewLines) {
 		end = len(v.viewLines)
 	}
-	chunkLines := make([]int, end)
-	copy(chunkLines, v.viewLines[:end])
+	newLines := make([]int, end-start)
+	copy(newLines, v.viewLines[start:end])
 	v.loaded = end
 	v.mu.Unlock()
 
-	v.setGrid(chunkLines)
+	// First chunk replaces any stale rows from previous content; subsequent
+	// chunks are appended so already-rendered lines are not rebuilt.
+	if start == 0 {
+		v.setGrid(newLines)
+	} else {
+		v.appendGrid(newLines)
+	}
 }
 
 func (v *JSONView) applyKeyFilter(key string) {
