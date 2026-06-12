@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+	"unicode/utf8"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/theme"
@@ -147,54 +148,91 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 	cells := make([]widget.TextGridCell, 0, len(line))
 	pending := make([]byte, 0, 32)
 	pendingColor := theme.ForegroundColor()
-	// Resolve theme-dependent colors once per line instead of per byte.
+	// Resolve theme-dependent colors once per line instead of per rune.
 	hlBg := highlightColor()
 	lnBg := lineNumberBgColor()
-	rangeIndex := 0
-	pos := 0
 
-	inHighlight := func(i int) bool {
-		if i < prefixLen {
+	// Prefix (line numbers) is ASCII, so its rune length equals its byte length.
+	prefixRuneLen := prefixLen
+	if prefixLen <= len(line) {
+		prefixRuneLen = utf8.RuneCount(line[:prefixLen])
+	}
+
+	// Highlight ranges arrive as BYTE offsets within the content (line without
+	// the prefix). Cells are emitted per RUNE, so convert them to rune offsets,
+	// otherwise multibyte text (Cyrillic, CJK, Arabic…) misaligns.
+	var runeHighlights []highlightRange
+	if len(highlights) > 0 && prefixLen <= len(line) {
+		content := line[prefixLen:]
+		runeHighlights = make([]highlightRange, 0, len(highlights))
+		for _, h := range highlights {
+			s, e := h.start, h.end
+			if s < 0 {
+				s = 0
+			}
+			if e > len(content) {
+				e = len(content)
+			}
+			if s >= e {
+				continue
+			}
+			runeHighlights = append(runeHighlights, highlightRange{
+				start: utf8.RuneCount(content[:s]),
+				end:   utf8.RuneCount(content[:e]),
+			})
+		}
+	}
+
+	rangeIndex := 0
+	bytePos := 0 // byte index into line
+	dispCol := 0 // emitted rune index (display column)
+
+	inHighlight := func(cc int) bool {
+		if cc < 0 {
 			return false
 		}
-		adj := i - prefixLen
-		for rangeIndex < len(highlights) && adj >= highlights[rangeIndex].end {
+		for rangeIndex < len(runeHighlights) && cc >= runeHighlights[rangeIndex].end {
 			rangeIndex++
 		}
-		if rangeIndex >= len(highlights) {
+		if rangeIndex >= len(runeHighlights) {
 			return false
 		}
-		return adj >= highlights[rangeIndex].start && adj < highlights[rangeIndex].end
+		return cc >= runeHighlights[rangeIndex].start && cc < runeHighlights[rangeIndex].end
 	}
-	inSelected := func(i int) bool {
+	inSelected := func(cc int) bool {
 		if selected.start == 0 && selected.end == 0 {
 			return false
 		}
-		if i < prefixLen {
-			return false
-		}
-		adj := i - prefixLen
-		return adj >= selected.start && adj < selected.end
+		return cc >= selected.start && cc < selected.end
 	}
 	flush := func() {
 		if len(pending) == 0 {
 			return
 		}
-		for _, b := range pending {
+		p := pending
+		for len(p) > 0 {
+			r, sz := utf8.DecodeRune(p)
+			if r == utf8.RuneError && sz == 1 {
+				// Invalid byte: keep it as-is so we still advance.
+				r = rune(p[0])
+			}
+			p = p[sz:]
 			var bg color.Color
 			bold := false
-			if pos < prefixLen {
+			if bytePos < prefixLen {
 				bg = lnBg
 			} else {
-				if inHighlight(pos) {
+				cc := dispCol - prefixRuneLen
+				if inHighlight(cc) {
 					bg = hlBg
 				}
-				if inSelected(pos) {
+				if inSelected(cc) {
 					bold = true
 				}
 			}
-			cells = append(cells, widget.TextGridCell{Rune: rune(b), Style: cellStyle(pendingColor, bg, bold)})
-			pos++
+			cells = append(cells, widget.TextGridCell{Rune: r, Style: cellStyle(pendingColor, bg, bold)})
+			bytePos += sz
+			dispCol++
 		}
 		pending = pending[:0]
 	}

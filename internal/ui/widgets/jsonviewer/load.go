@@ -86,7 +86,6 @@ func (v *JSONView) SetJSON(s string) {
 	v.trigramCapBytes = bundle.trigramCapBytes
 	v.trigramUsedBytes = bundle.trigramUsedBytes
 	v.rebuildViewLinesLocked()
-	v.recomputeContentWidthLocked()
 	v.mu.Unlock()
 
 	v.setSearchKeys(bundle.topKeys)
