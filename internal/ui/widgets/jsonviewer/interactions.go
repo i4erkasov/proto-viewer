@@ -18,6 +18,11 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 	if v.tgrid == nil {
 		return
 	}
+	// Клик по вьюверу забирает фокус у поля поиска, чтобы Cmd/Ctrl+C и
+	// Cmd/Ctrl+A (зарегистрированные на canvas) шли во вьювер.
+	if v.win != nil && v.overlay != nil {
+		v.win.Canvas().Focus(v.overlay)
+	}
 	// Одиночный клик снимает свободное выделение (Fyne не зовёт Tapped после
 	// протяжки, так что собственное выделение это не сбрасывает).
 	v.clearTextSelection()
@@ -71,13 +76,7 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 		return
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
-	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
-		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
-	} else if len(v.searchKeys) > 0 {
-		v.rebuildViewLinesForKeysLocked(v.searchKeys)
-	} else {
-		v.rebuildViewLinesLocked()
-	}
+	v.rebuildCurrentViewLocked()
 	v.mu.Unlock()
 
 	// Виртуализация: общая высота контента пересчитывается из нового viewLines,
@@ -205,7 +204,10 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 //
 // Overlay перехватывает мышь поверх TextGrid: одиночный тап (выбор токена /
 // разворот фолда), правый клик (контекст-меню) и протяжку для выделения текста
-// как в редакторе. Реализует Focusable+Shortcutable, чтобы ловить Cmd/Ctrl+C.
+// как в редакторе. Реализует Focusable, чтобы клик по вьюверу забирал фокус у
+// поля поиска — тогда Cmd/Ctrl+C и Cmd/Ctrl+A (зарегистрированные на canvas)
+// идут во вьювер. Намеренно НЕ реализует Shortcutable, иначе фокус на оверлее
+// «съедал» бы Cmd+F/Esc.
 
 type tapOverlay struct {
 	widget.BaseWidget
@@ -214,7 +216,6 @@ type tapOverlay struct {
 	onDragStart func(pos fyne.Position)
 	onDrag      func(pos fyne.Position)
 	onDragEnd   func()
-	onCopy      func()
 
 	downPos  fyne.Position
 	dragging bool
@@ -274,13 +275,6 @@ func (o *tapOverlay) FocusLost()                { o.focused = false }
 func (o *tapOverlay) TypedRune(_ rune)          {}
 func (o *tapOverlay) TypedKey(_ *fyne.KeyEvent) {}
 
-// fyne.Shortcutable: Cmd/Ctrl+C копирует выделение.
-func (o *tapOverlay) TypedShortcut(s fyne.Shortcut) {
-	if _, ok := s.(*fyne.ShortcutCopy); ok && o.onCopy != nil {
-		o.onCopy()
-	}
-}
-
 func (o *tapOverlay) CreateRenderer() fyne.WidgetRenderer {
 	rect := canvas.NewRectangle(color.Transparent)
 	return widget.NewSimpleRenderer(rect)
@@ -289,7 +283,8 @@ func (o *tapOverlay) CreateRenderer() fyne.WidgetRenderer {
 // escEntry provides a small helper to close the search on Escape.
 type escEntry struct {
 	widget.Entry
-	onEsc func()
+	onEsc  func()
+	onFind func()
 }
 
 func newEscEntry() *escEntry {
@@ -302,6 +297,10 @@ func (e *escEntry) SetOnEsc(fn func()) {
 	e.onEsc = fn
 }
 
+func (e *escEntry) SetOnFind(fn func()) {
+	e.onFind = fn
+}
+
 func (e *escEntry) TypedKey(ev *fyne.KeyEvent) {
 	if ev.Name == fyne.KeyEscape {
 		if e.onEsc != nil {
@@ -310,4 +309,17 @@ func (e *escEntry) TypedKey(ev *fyne.KeyEvent) {
 		}
 	}
 	e.Entry.TypedKey(ev)
+}
+
+// TypedShortcut перехватывает Cmd/Ctrl+F, пока поле поиска в фокусе, чтобы
+// повторное нажатие закрывало поиск (иначе Entry «съедает» шорткат и до
+// canvas-обработчика он не доходит). Остальные шорткаты (copy/paste/...) — как есть.
+func (e *escEntry) TypedShortcut(s fyne.Shortcut) {
+	if cs, ok := s.(*desktop.CustomShortcut); ok && cs.KeyName == fyne.KeyF {
+		if e.onFind != nil {
+			e.onFind()
+			return
+		}
+	}
+	e.Entry.TypedShortcut(s)
 }

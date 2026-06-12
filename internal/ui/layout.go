@@ -242,8 +242,18 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
 	registerSearchShortcuts(w.Canvas(), setJSONSearchVisible, func() bool { return jsonMarkdown.SearchVisible() })
 	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
+		// Esc работает независимо от фокуса: сначала закрываем пресет-диалог,
+		// иначе скрываем открытый поиск.
 		if loadPresetDialog != nil {
 			closeLoadPresetDialog()
+			return
+		}
+		if jsonMarkdown.SearchVisible() {
+			setJSONSearchVisible(false)
+			return
+		}
+		if jsonTree.SearchVisible() {
+			setSearchVisible(false)
 		}
 	})
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
@@ -256,11 +266,20 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return
 		}
 		if isJSONTab() {
-			v := jsonMarkdown.SelectedKeyValueString()
+			// Свободное выделение текста имеет приоритет над выбранным токеном.
+			v := jsonMarkdown.SelectedText()
+			if strings.TrimSpace(v) == "" {
+				v = jsonMarkdown.SelectedKeyValueString()
+			}
 			if strings.TrimSpace(v) == "" {
 				return
 			}
 			w.Clipboard().SetContent(v)
+		}
+	})
+	w.Canvas().AddShortcut(&fyne.ShortcutSelectAll{}, func(_ fyne.Shortcut) {
+		if isJSONTab() {
+			jsonMarkdown.SelectAll()
 		}
 	})
 	setSearchVisible(false)
@@ -769,10 +788,35 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	btnCollapse.Importance = widget.LowImportance
 	btnCollapse.Hide()
 
+	// Save decoded JSON to a file (диск рядом с кнопкой разворота окна).
+	btnSave := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
+		if strings.TrimSpace(fullJSON) == "" {
+			dialog.ShowInformation("Save", "Nothing to save yet", w)
+			return
+		}
+		d := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if wc == nil {
+				return // cancelled
+			}
+			defer func() { _ = wc.Close() }()
+			if _, err := wc.Write([]byte(fullJSON)); err != nil {
+				dialog.ShowError(err, w)
+			}
+		}, w)
+		d.SetFileName("decoded.json")
+		d.Show()
+	})
+	btnSave.Importance = widget.LowImportance
+
 	// Overlay buttons (same spot) so we don't reparent output tabs.
 	overlayButtons := container.NewStack(btnToggleOutput, btnCollapse)
+	rightButtons := container.NewHBox(btnSave, overlayButtons)
 	btnOverlay := container.NewVBox(
-		container.NewBorder(nil, nil, nil, overlayButtons, layout.NewSpacer()),
+		container.NewBorder(nil, nil, nil, rightButtons, layout.NewSpacer()),
 		layout.NewSpacer(),
 	)
 	outputStack := container.NewStack(outputContent, btnOverlay)
@@ -1028,90 +1072,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}()
 	}
 
-	btnCopy := widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), func() {
-		w.Clipboard().SetContent(fullJSON)
-		lblStatus.SetText("Status: copied")
-	})
-
-	btnOpenCache := widget.NewButtonWithIcon("Files", theme.FolderOpenIcon(), func() {
-		// Ensure cache dirs exist so 'open folder' always works even before first decode.
-		_ = dc.EnsureDirs()
-
-		switch sourceTabs.SelectedIndex() {
-		case 0:
-			// File tab: open exact cached file if possible.
-			p := strings.TrimSpace(fileTab.InputPath())
-			p = normalizeLocalPath(p)
-			if p == "" {
-				_ = openFolder(dc.Dir())
-				return
-			}
-			protoAbs := strings.TrimSpace(protoFile.Text)
-			typeName := strings.TrimSpace(typeSelect.Selected())
-			if protoAbs == "" || typeName == "" {
-				_ = openFolder(dc.Dir())
-				return
-			}
-
-			inFI, _ := os.Stat(p)
-			protoFI, _ := os.Stat(protoAbs)
-			key := cache.FileKey(p, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
-			jsonPath := dc.JSONPath(key)
-			if _, err := os.Stat(jsonPath); err == nil {
-				_ = revealFile(jsonPath)
-				return
-			}
-			_ = openFolder(dc.Dir())
-		case 1:
-			// Redis tab: open cache folder; try to select last saved file for selected key.
-			base := "redis"
-			if rk, ok := any(redisTab).(interface{ SelectedKey() string }); ok {
-				if v := strings.TrimSpace(rk.SelectedKey()); v != "" {
-					base = v
-				}
-			}
-			// sanitize like in saveLargeOutput
-			repl := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", " ", "_")
-			base = repl.Replace(strings.TrimSpace(base))
-			if base == "" {
-				_ = openFolder(dc.Dir())
-				return
-			}
-			if len(base) > 80 {
-				base = base[:80]
-			}
-			matches, _ := filepath.Glob(filepath.Join(dc.Dir(), base+"-*.json"))
-			if len(matches) == 0 {
-				_ = openFolder(dc.Dir())
-				return
-			}
-			// pick newest
-			newest := ""
-			var newestT time.Time
-			for _, m := range matches {
-				fi, err := os.Stat(m)
-				if err != nil {
-					continue
-				}
-				if newest == "" || fi.ModTime().After(newestT) {
-					newest = m
-					newestT = fi.ModTime()
-				}
-			}
-			if newest != "" {
-				_ = revealFile(newest)
-				return
-			}
-			_ = openFolder(dc.Dir())
-		default:
-			// Any other tab/state: just open cache folder.
-			_ = openFolder(dc.Dir())
-		}
-	})
-	btnOpenCache.Importance = widget.LowImportance
-
-	btnCopy.Importance = widget.LowImportance
-	actions := container.NewHBox(lblStatus, layout.NewSpacer(), container.NewHBox(btnDecode, btnCopy, btnOpenCache))
+	actions := container.NewHBox(lblStatus, layout.NewSpacer(), container.NewHBox(btnDecode))
 
 	resultPanel = container.NewBorder(nil, actions, nil, nil, outputStack)
 

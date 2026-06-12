@@ -96,6 +96,49 @@ func findFoldTokenBytes(line []byte) (int, byte) {
 	return -1, 0
 }
 
+// rebuildCurrentViewLocked перестраивает viewLines с учётом активного режима
+// (структурный поиск / фильтр по ключам / обычный). Должна вызываться под v.mu.
+func (v *JSONView) rebuildCurrentViewLocked() {
+	if v.searchStructural && v.searchMatchSet != nil && len(v.searchMatchSet) > 0 {
+		v.rebuildViewLinesForMatchesLocked(v.searchMatchSet)
+	} else if len(v.searchKeys) > 0 {
+		v.rebuildViewLinesForKeysLocked(v.searchKeys)
+	} else {
+		v.rebuildViewLinesLocked()
+	}
+}
+
+// CollapseAll сворачивает все узлы документа.
+func (v *JSONView) CollapseAll() {
+	v.mu.Lock()
+	if v.fullBuf == nil || len(v.foldRanges) == 0 {
+		v.mu.Unlock()
+		return
+	}
+	for start := range v.foldRanges {
+		v.folded[start] = true
+	}
+	v.rebuildCurrentViewLocked()
+	v.mu.Unlock()
+	v.resetScroll()
+	v.updateWindow()
+}
+
+// ExpandAll разворачивает все узлы документа.
+func (v *JSONView) ExpandAll() {
+	v.mu.Lock()
+	if v.fullBuf == nil || len(v.foldRanges) == 0 {
+		v.mu.Unlock()
+		return
+	}
+	for start := range v.foldRanges {
+		v.folded[start] = false
+	}
+	v.rebuildCurrentViewLocked()
+	v.mu.Unlock()
+	v.updateWindow()
+}
+
 func findViewRow(viewLines []int, srcLine int) int {
 	for i, v := range viewLines {
 		if viewLineIndex(v) == srcLine {

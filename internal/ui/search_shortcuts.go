@@ -8,18 +8,13 @@ import (
 )
 
 func registerSearchShortcuts(c fyne.Canvas, setVisible func(bool), isVisible func() bool) {
-	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierShortcutDefault}, func(shortcut fyne.Shortcut) {
-		setVisible(true)
-	})
-	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierControl}, func(shortcut fyne.Shortcut) {
-		setVisible(true)
-	})
-	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierSuper}, func(shortcut fyne.Shortcut) {
-		setVisible(true)
-	})
-	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(shortcut fyne.Shortcut) {
-		if isVisible() {
-			setVisible(false)
-		}
-	})
+	// Cmd/Ctrl+F переключает поиск: показать, если скрыт, и скрыть при повторном
+	// нажатии. Escape обрабатывается единым обработчиком в layout (чтобы закрывать
+	// поиск даже когда поле ввода не в фокусе).
+	toggle := func(_ fyne.Shortcut) {
+		setVisible(!isVisible())
+	}
+	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierShortcutDefault}, toggle)
+	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierControl}, toggle)
+	c.AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: fyne.KeyModifierSuper}, toggle)
 }

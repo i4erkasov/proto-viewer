@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -54,12 +55,95 @@ func looksLikeGzip(b []byte) bool {
 	return len(b) >= 3 && b[0] == 0x1f && b[1] == 0x8b && b[2] == 0x08
 }
 
+// --- Descriptor-set cache
+//
+// Компиляция .proto в FileDescriptorSet требует запуска protoc подпроцессом
+// (а на Windows это дорого: создание процесса + антивирус + первая распаковка).
+// Один и тот же .proto обычно используется для множества разных payload'ов
+// (разные Redis-ключи / .bin), поэтому кэшируем результат в памяти и
+// перекомпилируем только если изменился сам .proto или любой из его импортов.
+
+type fileStamp struct {
+	size  int64
+	mtime int64
+}
+
+type descCacheEntry struct {
+	fds   *descriptorpb.FileDescriptorSet
+	files map[string]fileStamp // абсолютный путь -> отпечаток
+}
+
+var (
+	descCacheMu sync.Mutex
+	descCache   = map[string]*descCacheEntry{}
+)
+
+func descKey(protoRoot, protoAbs string) string {
+	return protoRoot + "\x00" + protoAbs
+}
+
+func statStamp(path string) (fileStamp, bool) {
+	fi, err := os.Stat(path)
+	if err != nil || fi.IsDir() {
+		return fileStamp{}, false
+	}
+	return fileStamp{size: fi.Size(), mtime: fi.ModTime().UnixNano()}, true
+}
+
+// descCacheGet возвращает закэшированный набор, если все его файлы не изменились.
+func descCacheGet(key string) (*descriptorpb.FileDescriptorSet, bool) {
+	descCacheMu.Lock()
+	defer descCacheMu.Unlock()
+	entry, ok := descCache[key]
+	if !ok {
+		return nil, false
+	}
+	for path, want := range entry.files {
+		got, ok := statStamp(path)
+		if !ok || got != want {
+			delete(descCache, key) // устарел — выкинуть
+			return nil, false
+		}
+	}
+	return entry.fds, true
+}
+
+// descCachePut сохраняет набор и отпечаток всех его файлов, найденных под root.
+func descCachePut(key, protoRoot string, fds *descriptorpb.FileDescriptorSet) {
+	files := make(map[string]fileStamp, len(fds.GetFile()))
+	for _, f := range fds.GetFile() {
+		// Имена в наборе — пути относительно -I root. Well-known типы
+		// (google/protobuf/*) под root не лежат — их пропускаем (они стабильны).
+		p := filepath.Join(protoRoot, filepath.FromSlash(f.GetName()))
+		if stamp, ok := statStamp(p); ok {
+			files[p] = stamp
+		}
+	}
+	descCacheMu.Lock()
+	descCache[key] = &descCacheEntry{fds: fds, files: files}
+	descCacheMu.Unlock()
+}
+
 func compileDescriptorSet(ctx context.Context, protoRoot, protoAbs string) (*descriptorpb.FileDescriptorSet, error) {
+	key := descKey(protoRoot, protoAbs)
+	if fds, ok := descCacheGet(key); ok {
+		perf.Log("descriptor cache hit (%s)", protoAbs)
+		return fds, nil
+	}
 	relProto, err := relToRoot(protoRoot, protoAbs)
 	if err != nil {
 		return nil, err
 	}
+	fds, err := runProtocDescriptorSet(ctx, protoRoot, relProto)
+	if err != nil {
+		return nil, err
+	}
+	descCachePut(key, protoRoot, fds)
+	return fds, nil
+}
 
+// runProtocDescriptorSet компилирует .proto в FileDescriptorSet через protoc.
+func runProtocDescriptorSet(ctx context.Context, protoRoot, relProto string) (*descriptorpb.FileDescriptorSet, error) {
 	tmp, err := os.CreateTemp("", "protoset-*.pb")
 	if err != nil {
 		return nil, err

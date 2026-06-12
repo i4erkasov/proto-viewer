@@ -115,7 +115,6 @@ func NewJSONMarkdownView(win fyne.Window) *JSONView {
 	v.overlay.onDragStart = v.beginTextSelection
 	v.overlay.onDrag = v.updateTextSelection
 	v.overlay.onDragEnd = v.endTextSelection
-	v.overlay.onCopy = v.copySelection
 	v.probeMetrics()
 	// Кастомный layout имитирует полную высоту контента, а в TextGrid лежит
 	// только видимое окно строк (виртуализация вьюпорта).
@@ -133,6 +132,11 @@ func NewJSONMarkdownView(win fyne.Window) *JSONView {
 		v.navigateMatch(1)
 	}
 	v.searchEntry.SetOnEsc(func() {
+		if v.SearchVisible() {
+			v.SetSearchVisible(false)
+		}
+	})
+	v.searchEntry.SetOnFind(func() {
 		if v.SearchVisible() {
 			v.SetSearchVisible(false)
 		}
