@@ -63,6 +63,16 @@ type JSONView struct {
 	selectedValueRange highlightRange
 	selectedValueText  string
 
+	// Свободное выделение текста мышью (как в редакторе). Координаты —
+	// абсолютные: строка в viewLines и рунный индекс в КОНТЕНТЕ строки (без
+	// префикса с номером строки). anchor — точка нажатия, cur — текущий конец.
+	selActive    bool
+	selecting    bool
+	selAnchorRow int
+	selAnchorCol int
+	selCurRow    int
+	selCurCol    int
+
 	searchKeySelect  *searchselect.SearchableSelect
 	searchKeyWidth   float32
 	searchKeys       []string
@@ -102,6 +112,10 @@ func NewJSONMarkdownView(win fyne.Window) *JSONView {
 	v.win = win
 	v.tgrid = widget.NewTextGrid()
 	v.overlay = newTapOverlay(v.handleTap, v.handleSecondaryTap)
+	v.overlay.onDragStart = v.beginTextSelection
+	v.overlay.onDrag = v.updateTextSelection
+	v.overlay.onDragEnd = v.endTextSelection
+	v.overlay.onCopy = v.copySelection
 	v.probeMetrics()
 	// Кастомный layout имитирует полную высоту контента, а в TextGrid лежит
 	// только видимое окно строк (виртуализация вьюпорта).

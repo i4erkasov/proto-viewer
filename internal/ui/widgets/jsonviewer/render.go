@@ -84,7 +84,7 @@ func isNumberChar(r rune) bool {
 	return unicode.IsDigit(r) || r == '.' || r == 'e' || r == 'E' || r == '+' || r == '-'
 }
 
-func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange) []widget.TextGridRow {
+func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange) []widget.TextGridRow {
 	if len(lines) == 0 {
 		return nil
 	}
@@ -103,10 +103,14 @@ func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]high
 				sel = selectedRange
 			}
 		}
+		var selBg highlightRange
+		if i < len(selSpans) {
+			selBg = selSpans[i]
+		}
 		fullLine := make([]byte, 0, len(prefix)+len(line))
 		fullLine = append(fullLine, prefix...)
 		fullLine = append(fullLine, line...)
-		cells := buildTextGridCells(fullLine, hl, len(prefix), sel)
+		cells := buildTextGridCells(fullLine, hl, len(prefix), sel, selBg)
 		rows = append(rows, widget.TextGridRow{Cells: cells})
 	}
 	return rows
@@ -141,7 +145,7 @@ func cellStyle(fg, bg color.Color, bold bool) *widget.CustomTextGridStyle {
 	return s
 }
 
-func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange) []widget.TextGridCell {
+func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange, selBg highlightRange) []widget.TextGridCell {
 	if len(line) == 0 {
 		return nil
 	}
@@ -151,6 +155,8 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 	// Resolve theme-dependent colors once per line instead of per rune.
 	hlBg := highlightColor()
 	lnBg := lineNumberBgColor()
+	selColor := selectionColor()
+	hasSel := selBg.end > selBg.start
 
 	// Prefix (line numbers) is ASCII, so its rune length equals its byte length.
 	prefixRuneLen := prefixLen
@@ -223,7 +229,10 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 				bg = lnBg
 			} else {
 				cc := dispCol - prefixRuneLen
-				if inHighlight(cc) {
+				switch {
+				case hasSel && cc >= selBg.start && cc < selBg.end:
+					bg = selColor // выделение текста перекрывает подсветку поиска
+				case inHighlight(cc):
 					bg = hlBg
 				}
 				if inSelected(cc) {
@@ -588,6 +597,8 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 		selectedRange = v.selectedValueRange
 	}
 	buf := v.fullBuf
+	winStart := v.winStart
+	selActive := v.selActive
 	v.mu.Unlock()
 
 	lineBytes, srcLines, placeholders := buildViewLineBytes(buf, viewLines)
@@ -598,5 +609,17 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 			highlights = buildVisibleHighlightsBytes(lineBytes, srcLines, placeholders, queryLower, matchSet)
 		}
 	}
-	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange)
+
+	// Диапазоны свободного выделения текста — по абсолютной строке окна.
+	var selSpans []highlightRange
+	if selActive {
+		selSpans = make([]highlightRange, len(lineBytes))
+		v.mu.Lock()
+		for i := range lineBytes {
+			selSpans[i] = v.selSpanForRowLocked(winStart+i, utf8.RuneCount(lineBytes[i]))
+		}
+		v.mu.Unlock()
+	}
+
+	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans)
 }

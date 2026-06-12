@@ -8,6 +8,7 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -17,6 +18,9 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 	if v.tgrid == nil {
 		return
 	}
+	// Одиночный клик снимает свободное выделение (Fyne не зовёт Tapped после
+	// протяжки, так что собственное выделение это не сбрасывает).
+	v.clearTextSelection()
 	row, col := v.tgrid.CursorLocationForPosition(pos)
 	if row < 0 {
 		return
@@ -115,14 +119,25 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 	fullKey, fullVal, kvOk := extractKeyValue(viewLine)
 	fullBlockVal, blockOk := v.fullValueForLine(srcLine)
 
+	// Если активно свободное выделение текста, правый клик не трогает его —
+	// просто предложим скопировать.
+	rawSel := v.SelectedText()
+	hasTextSel := strings.TrimSpace(rawSel) != ""
+
 	if keyOk {
-		v.setSelectedKey(srcLine, keyRange, keyText)
+		if !hasTextSel {
+			v.setSelectedKey(srcLine, keyRange, keyText)
+		}
 	} else if valOk {
-		v.setSelectedValue(srcLine, valRange, valText)
-	} else {
+		if !hasTextSel {
+			v.setSelectedValue(srcLine, valRange, valText)
+		}
+	} else if !hasTextSel {
 		return
 	}
-	v.refreshSelection()
+	if !hasTextSel {
+		v.refreshSelection()
+	}
 
 	if blockOk {
 		fullVal = fullBlockVal
@@ -166,7 +181,17 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 		valItem.Disabled = true
 	}
 
-	menu := fyne.NewMenu("", keyItem, valItem)
+	var items []*fyne.MenuItem
+	if hasTextSel {
+		sel := rawSel
+		items = append(items, fyne.NewMenuItem("Copy selection", func() {
+			if v.win != nil {
+				v.win.Clipboard().SetContent(sel)
+			}
+		}))
+	}
+	items = append(items, keyItem, valItem)
+	menu := fyne.NewMenu("", items...)
 
 	absPos := pos
 	if d := fyne.CurrentApp().Driver(); d != nil {
@@ -177,11 +202,23 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 }
 
 // --- Tap overlay
+//
+// Overlay перехватывает мышь поверх TextGrid: одиночный тап (выбор токена /
+// разворот фолда), правый клик (контекст-меню) и протяжку для выделения текста
+// как в редакторе. Реализует Focusable+Shortcutable, чтобы ловить Cmd/Ctrl+C.
 
 type tapOverlay struct {
 	widget.BaseWidget
 	onTap       func(pos fyne.Position)
 	onSecondary func(pos fyne.Position)
+	onDragStart func(pos fyne.Position)
+	onDrag      func(pos fyne.Position)
+	onDragEnd   func()
+	onCopy      func()
+
+	downPos  fyne.Position
+	dragging bool
+	focused  bool
 }
 
 func newTapOverlay(onTap func(pos fyne.Position), onSecondary func(pos fyne.Position)) *tapOverlay {
@@ -191,6 +228,7 @@ func newTapOverlay(onTap func(pos fyne.Position), onSecondary func(pos fyne.Posi
 }
 
 func (o *tapOverlay) Tapped(ev *fyne.PointEvent) {
+	// Fyne не вызывает Tapped после протяжки, так что это всегда «чистый» клик.
 	if o.onTap != nil {
 		o.onTap(ev.Position)
 	}
@@ -199,6 +237,47 @@ func (o *tapOverlay) Tapped(ev *fyne.PointEvent) {
 func (o *tapOverlay) TappedSecondary(ev *fyne.PointEvent) {
 	if o.onSecondary != nil {
 		o.onSecondary(ev.Position)
+	}
+}
+
+// desktop.Mouseable: фиксируем точку нажатия как якорь выделения.
+func (o *tapOverlay) MouseDown(ev *desktop.MouseEvent) {
+	o.downPos = ev.Position
+	o.dragging = false
+}
+
+func (o *tapOverlay) MouseUp(_ *desktop.MouseEvent) {}
+
+// fyne.Draggable: протяжка мышью = выделение текста.
+func (o *tapOverlay) Dragged(ev *fyne.DragEvent) {
+	if !o.dragging {
+		o.dragging = true
+		if o.onDragStart != nil {
+			o.onDragStart(o.downPos)
+		}
+	}
+	if o.onDrag != nil {
+		o.onDrag(ev.Position)
+	}
+}
+
+func (o *tapOverlay) DragEnd() {
+	o.dragging = false
+	if o.onDragEnd != nil {
+		o.onDragEnd()
+	}
+}
+
+// fyne.Focusable
+func (o *tapOverlay) FocusGained()              { o.focused = true }
+func (o *tapOverlay) FocusLost()                { o.focused = false }
+func (o *tapOverlay) TypedRune(_ rune)          {}
+func (o *tapOverlay) TypedKey(_ *fyne.KeyEvent) {}
+
+// fyne.Shortcutable: Cmd/Ctrl+C копирует выделение.
+func (o *tapOverlay) TypedShortcut(s fyne.Shortcut) {
+	if _, ok := s.(*fyne.ShortcutCopy); ok && o.onCopy != nil {
+		o.onCopy()
 	}
 }
 
