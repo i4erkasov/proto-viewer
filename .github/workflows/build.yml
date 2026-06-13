@@ -15,7 +15,7 @@ jobs:
           - runner: ubuntu-latest
             fyne_os: linux
             artifact: proto-viewer-linux
-          - runner: macos-latest
+          - runner: macos-14
             fyne_os: darwin
             artifact: proto-viewer-macos
           - runner: windows-latest
@@ -55,6 +55,29 @@ jobs:
       - name: Package
         shell: bash
         run: fyne package --os ${{ matrix.fyne_os }} --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon "$GITHUB_WORKSPACE/assets/icon.png"
+
+      # Делаем бинарь внутри .app универсальным (arm64 + x86_64), чтобы один
+      # .app работал на любом Mac. Раннер arm64: fyne уже собрал arm64-слайс;
+      # докомпилируем x86_64 (SDK macOS универсальный) и склеиваем через lipo.
+      - name: Universal macOS binary
+        if: matrix.fyne_os == 'darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(find . -maxdepth 3 -name "*.app" -type d | head -1)
+          EXE=$(find "$APP/Contents/MacOS" -type f -perm +111 | head -1)
+          echo "app: $APP"
+          echo "exe: $EXE"
+          CGO_ENABLED=1 GOARCH=amd64 \
+            CC="clang -arch x86_64" \
+            CGO_CFLAGS="-arch x86_64" \
+            CGO_LDFLAGS="-arch x86_64" \
+            go build -o /tmp/pv-amd64 ./cmd/app
+          lipo -create "$EXE" /tmp/pv-amd64 -output /tmp/pv-universal
+          mv /tmp/pv-universal "$EXE"
+          chmod +x "$EXE"
+          echo "result:"
+          lipo -info "$EXE"
 
       # .app — это каталог; упаковываем в zip для артефакта.
       - name: Zip .app (macOS)

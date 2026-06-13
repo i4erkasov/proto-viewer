@@ -496,7 +496,7 @@ func isDarkColor(c color.Color) bool {
 	return lum < 0.5
 }
 
-func trigramCandidatesFromIndex(idx map[[3]byte]trigramRange, postings []int32, queryLower []byte) []int {
+func trigramCandidatesFromIndex(idx map[[3]byte][]int32, queryLower []byte) []int {
 	if idx == nil || len(queryLower) < 3 {
 		return nil
 	}
@@ -506,14 +506,11 @@ func trigramCandidatesFromIndex(idx map[[3]byte]trigramRange, postings []int32, 
 	}
 	lists := make([][]int32, 0, len(trigrams))
 	for _, tri := range trigrams {
-		r, ok := idx[tri]
-		if !ok || r.length == 0 {
+		lst, ok := idx[tri]
+		if !ok || len(lst) == 0 {
 			return []int{}
 		}
-		if r.offset < 0 || r.offset+r.length > len(postings) {
-			return []int{}
-		}
-		lists = append(lists, postings[r.offset:r.offset+r.length])
+		lists = append(lists, lst)
 	}
 	sort.Slice(lists, func(i, j int) bool { return len(lists[i]) < len(lists[j]) })
 	base := append([]int32(nil), lists[0]...)

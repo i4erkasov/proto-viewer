@@ -91,8 +91,7 @@ type JSONView struct {
 	searchKeyFold    map[string]int
 	searchSeq        uint64
 	searchMatchSet   map[int]struct{}
-	trigramIndex     map[[3]byte]trigramRange
-	trigramPostings  []int32
+	trigramIndex     map[[3]byte][]int32
 	trigramEnabled   bool
 	trigramCapBytes  int
 	trigramUsedBytes int

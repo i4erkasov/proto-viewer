@@ -1090,7 +1090,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			dialog.ShowInformation("Diff", "Сначала декодируй сторону A (текущий результат пуст)", w)
 			return
 		}
-		openDiffWindow(deps, fullJSON, getProto)
+		openDiffWindow(w, deps, fullJSON, getProto)
 	}
 
 	// Root
@@ -1156,6 +1156,12 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return
 		}
 
+		// Если открыт модальный выбор источника B — дроп идёт туда.
+		if diffDropTarget != nil {
+			diffDropTarget(p)
+			return
+		}
+
 		sourceTabs.SelectIndex(0)
 		fileTab.SetFilePath(p)
 		fileTab.FlashDropHighlight()
@@ -1167,7 +1173,33 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		logMu           sync.Mutex
 		logLines        []string
 		logFlushPending bool
+		logFile         *os.File // открыт, пока включено логирование (пишем рядом с приложением)
 	)
+
+	// openLogFile создаёт файл лога в папке logs рядом с приложением
+	// (с фоллбэком на cwd/temp). Имя: log-<дата-время включения>.log
+	openLogFile := func() (*os.File, string) {
+		name := "log-" + time.Now().Format("2006-01-02_15-04-05") + ".log"
+		var dirs []string
+		if exe, err := os.Executable(); err == nil {
+			dirs = append(dirs, filepath.Dir(exe))
+		}
+		if cwd, err := os.Getwd(); err == nil {
+			dirs = append(dirs, cwd)
+		}
+		dirs = append(dirs, os.TempDir())
+		for _, d := range dirs {
+			logsDir := filepath.Join(d, "logs")
+			if err := os.MkdirAll(logsDir, 0o755); err != nil {
+				continue
+			}
+			p := filepath.Join(logsDir, name)
+			if f, err := os.Create(p); err == nil {
+				return f, p
+			}
+		}
+		return nil, ""
+	}
 	logText := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
 	logText.Wrapping = fyne.TextWrapOff
 	logScroll := container.NewVScroll(logText)
@@ -1193,35 +1225,13 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		}
 	})
 	logToggleBtn.Importance = widget.LowImportance
-	logSaveBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
-		logMu.Lock()
-		txt := strings.Join(logLines, "\n")
-		logMu.Unlock()
-		if strings.TrimSpace(txt) == "" {
-			dialog.ShowInformation("Save logs", "Логи пусты", w)
-			return
-		}
-		d := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
-			if err != nil {
-				dialog.ShowError(err, w)
-				return
-			}
-			if wc == nil {
-				return // cancelled
-			}
-			defer func() { _ = wc.Close() }()
-			if _, err := wc.Write([]byte(txt)); err != nil {
-				dialog.ShowError(err, w)
-			}
-		}, w)
-		d.SetFileName("proto-viewer-logs.txt")
-		d.Show()
-	})
-	logSaveBtn.Importance = widget.LowImportance
-	logHeader := container.NewBorder(nil, nil, logToggleBtn, logSaveBtn, layout.NewSpacer())
+	logHeader := container.NewBorder(nil, nil, logToggleBtn, nil, layout.NewSpacer())
 	logPanel := container.NewVBox(widget.NewSeparator(), logHeader, logScroll)
 	logPanel.Hide()
 	if perf.Enabled() {
+		if f, _ := openLogFile(); f != nil {
+			logFile = f
+		}
 		perf.LogEnv()
 		logPanel.Show()
 	}
@@ -1248,6 +1258,9 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		logLines = append(logLines, line)
 		if len(logLines) > logCap {
 			logLines = logLines[len(logLines)-logCap:]
+		}
+		if logFile != nil {
+			fmt.Fprintln(logFile, line)
 		}
 		logMu.Unlock()
 		scheduleLogFlush()
@@ -1277,11 +1290,30 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		// Пересобираем нативное меню, чтобы галочка обновилась.
 		w.SetMainMenu(mainMenu)
 		if on {
+			logMu.Lock()
+			logPath := ""
+			if logFile == nil {
+				if f, p := openLogFile(); f != nil {
+					logFile = f
+					logPath = p
+				}
+			}
+			logMu.Unlock()
 			perf.LogEnv()
 			logPanel.Show()
 			flushLogs()
-			lblStatus.SetText("Status: perf logs ON")
+			if logPath != "" {
+				lblStatus.SetText("Status: perf logs ON → " + logPath)
+			} else {
+				lblStatus.SetText("Status: perf logs ON")
+			}
 		} else {
+			logMu.Lock()
+			if logFile != nil {
+				_ = logFile.Close()
+				logFile = nil
+			}
+			logMu.Unlock()
 			logPanel.Hide()
 			lblStatus.SetText("Status: perf logs OFF")
 		}

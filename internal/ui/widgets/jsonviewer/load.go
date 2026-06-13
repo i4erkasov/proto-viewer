@@ -84,7 +84,6 @@ func (v *JSONView) SetJSON(s string) {
 	v.searchKeyFold = bundle.keyFold
 	v.lineNumWidth = bundle.lineNumWidth
 	v.trigramIndex = bundle.trigramIndex
-	v.trigramPostings = bundle.trigramPostings
 	v.trigramEnabled = bundle.trigramEnabled
 	v.trigramCapBytes = bundle.trigramCapBytes
 	v.trigramUsedBytes = bundle.trigramUsedBytes
@@ -248,18 +247,12 @@ type indexBundle struct {
 	keyFold          map[string]int
 	searchIndex      map[string][]int
 	searchAll        []int
-	trigramIndex     map[[3]byte]trigramRange
-	trigramPostings  []int32
+	trigramIndex     map[[3]byte][]int32
 	trigramEnabled   bool
 	trigramCapBytes  int
 	trigramUsedBytes int
 	lineNumWidth     int
 	topKeys          []string
-}
-
-type trigramRange struct {
-	offset int
-	length int
 }
 
 func buildIndexBundleFromBytes(data []byte) indexBundle {
@@ -287,17 +280,9 @@ func buildIndexBundleFromBytes(data []byte) indexBundle {
 	capBytes := trigramCapBytes(len(data))
 	trigramEnabled := capBytes > 0
 	trigramUsed := 0
-	var trigramIndex map[[3]byte]trigramRange
-	postingsCap := capBytes / 4
-	if postingsCap < 1024 {
-		postingsCap = 1024
-	}
-	if postingsCap > len(data) {
-		postingsCap = len(data)
-	}
-	postings := make([]int32, 0, postingsCap)
+	var trigramIndex map[[3]byte][]int32
 	if trigramEnabled {
-		trigramIndex = make(map[[3]byte]trigramRange, len(data)/64+1)
+		trigramIndex = make(map[[3]byte][]int32, len(data)/64+1)
 	}
 
 	type foldEntry struct {
@@ -330,37 +315,26 @@ func buildIndexBundleFromBytes(data []byte) indexBundle {
 			}
 		}
 
-		if trigramEnabled {
-			if len(line) >= 3 {
-				var seen map[[3]byte]struct{}
-				if len(line) > 64 {
-					seen = make(map[[3]byte]struct{}, 16)
+		if trigramEnabled && len(line) >= 3 {
+			seen := make(map[[3]byte]struct{}, len(line))
+			for i := 0; i+2 < len(line); i++ {
+				tri := [3]byte{toLowerASCII(line[i]), toLowerASCII(line[i+1]), toLowerASCII(line[i+2])}
+				if _, ok := seen[tri]; ok {
+					continue
 				}
-				for i := 0; i+2 < len(line); i++ {
-					tri := [3]byte{toLowerASCII(line[i]), toLowerASCII(line[i+1]), toLowerASCII(line[i+2])}
-					if seen != nil {
-						if _, ok := seen[tri]; ok {
-							continue
-						}
-						seen[tri] = struct{}{}
-					}
-					if r, ok := trigramIndex[tri]; ok {
-						postings = append(postings, int32(lineNum))
-						r.length++
-						trigramIndex[tri] = r
-						trigramUsed += 4
-					} else {
-						trigramIndex[tri] = trigramRange{offset: len(postings), length: 1}
-						postings = append(postings, int32(lineNum))
-						trigramUsed += 28
-					}
-					if trigramUsed > capBytes {
-						trigramIndex = nil
-						trigramEnabled = false
-						postings = nil
-						trigramUsed = 0
-						break
-					}
+				seen[tri] = struct{}{}
+				lst, existed := trigramIndex[tri]
+				// lineNum монотонно растёт → постинги уже отсортированы.
+				trigramIndex[tri] = append(lst, int32(lineNum))
+				if existed {
+					trigramUsed += 4
+				} else {
+					trigramUsed += 28
+				}
+				if trigramUsed > capBytes {
+					trigramIndex = nil
+					trigramEnabled = false
+					break
 				}
 			}
 		}
@@ -463,7 +437,6 @@ func buildIndexBundleFromBytes(data []byte) indexBundle {
 	bundle.searchIndex = searchIndex
 	bundle.searchAll = allLines
 	bundle.trigramIndex = trigramIndex
-	bundle.trigramPostings = postings
 	bundle.trigramEnabled = trigramEnabled
 	bundle.trigramCapBytes = capBytes
 	bundle.trigramUsedBytes = trigramUsed

@@ -50,7 +50,6 @@ func (v *JSONView) applySearchAsync(q string) {
 	keyRanges := v.searchKeyRanges
 	trigramEnabled := v.trigramEnabled
 	trigramIndex := v.trigramIndex
-	trigramPostings := v.trigramPostings
 	v.searchQuery = query
 	if len(v.viewLines) > 0 {
 		first := viewLineIndex(v.viewLines[0])
@@ -98,7 +97,7 @@ func (v *JSONView) applySearchAsync(q string) {
 	}
 
 	if trigramEnabled && trigramIndex != nil && len(queryLower) >= 3 {
-		triCandidates := trigramCandidatesFromIndex(trigramIndex, trigramPostings, queryLower)
+		triCandidates := trigramCandidatesFromIndex(trigramIndex, queryLower)
 		if triCandidates != nil {
 			candidates = intersectSortedInts(candidates, triCandidates)
 		}

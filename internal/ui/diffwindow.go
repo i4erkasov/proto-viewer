@@ -21,40 +21,29 @@ import (
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsonviewer"
 )
 
-// diffPickerWin — открытое окно выбора источника B (одновременно только одно).
-var diffPickerWin fyne.Window
+// diffDropTarget — пока открыт модальный выбор источника B, дроп файла в главное
+// окно роутится сюда (а не в главный File-таб). nil — когда диалог закрыт.
+var diffDropTarget func(path string)
 
-// openDiffWindow открывает окно выбора второго источника (B): вкладки File/Redis
-// + кнопка Compare. После Compare декодирует B (общими proto-настройками) и
-// открывает окно сравнения с уже декодированным jsonA.
-func openDiffWindow(deps Deps, jsonA string, getProto func() (string, string, string, bool)) {
-	app := fyne.CurrentApp()
-	if app == nil {
-		return
-	}
-	// Не открываем второе окно выбора — фокусируем уже открытое.
-	if diffPickerWin != nil {
-		diffPickerWin.RequestFocus()
-		return
-	}
-	win := app.NewWindow("Diff — choose second source (B)")
-	diffPickerWin = win
-	win.SetOnClosed(func() { diffPickerWin = nil })
-
-	fileTab := tab.NewTabFile(win, deps.FileRepo)
-	redisTab := tab.NewTabRedis(win, deps.RedisRepo)
+// openDiffWindow показывает МОДАЛЬНЫЙ диалог выбора второго источника (B) в
+// главном окне: вкладки File/Redis + Compare. После Compare декодирует B и
+// открывает отдельное окно сравнения с jsonA.
+func openDiffWindow(parent fyne.Window, deps Deps, jsonA string, getProto func() (string, string, string, bool)) {
+	fileTab := tab.NewTabFile(parent, deps.FileRepo)
+	redisTab := tab.NewTabRedis(parent, deps.RedisRepo)
 	tabs := container.NewAppTabs(
 		container.NewTabItem(fileTab.Title(), container.NewBorder(fileTab.View(), nil, nil, nil, nil)),
 		container.NewTabItem(redisTab.Title(), container.NewBorder(redisTab.View(), nil, nil, nil, nil)),
 	)
 
 	status := widget.NewLabel("")
+	var dlg dialog.Dialog
 	compare := widget.NewButtonWithIcon("Compare", assets.CompareIcon, nil)
 	compare.Importance = widget.HighImportance
 	compare.OnTapped = func() {
 		root, file, typ, gzip := getProto()
 		if root == "" || file == "" || typ == "" {
-			dialog.ShowError(fmt.Errorf("задай proto root/file/message type в главном окне"), win)
+			dialog.ShowError(fmt.Errorf("задай proto root/file/message type в главном окне"), parent)
 			return
 		}
 		var src interface {
@@ -79,7 +68,7 @@ func openDiffWindow(deps Deps, jsonA string, getProto func() (string, string, st
 
 			payload, err := src.Fetch(ctx)
 			if err != nil {
-				fyne.Do(func() { status.SetText("error"); dialog.ShowError(err, win) })
+				fyne.Do(func() { status.SetText("error"); dialog.ShowError(err, parent) })
 				return
 			}
 			res, err := deps.Decoder.Decode(ctx, domain.DecodeRequest{
@@ -87,37 +76,48 @@ func openDiffWindow(deps Deps, jsonA string, getProto func() (string, string, st
 				Gzip: gzip, Format: domain.OutputFormatJSON, Bytes: payload,
 			})
 			if err != nil {
-				fyne.Do(func() { status.SetText("error"); dialog.ShowError(err, win) })
+				fyne.Do(func() { status.SetText("error"); dialog.ShowError(err, parent) })
 				return
 			}
 			jsonB := strings.TrimSpace(res.Raw)
 			fyne.Do(func() {
-				win.Close()
+				dlg.Hide()
 				openDiffResult(jsonA, jsonB)
 			})
 		}()
 	}
 
-	// Drag&drop файла в это окно → во вкладку File.
-	win.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
-		if len(uris) == 0 || uris[0] == nil {
-			return
+	cancel := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
+		if dlg != nil {
+			dlg.Hide()
 		}
-		p := uris[0].Path()
-		if p == "" {
-			p = uris[0].String()
-		}
-		if p == "" {
-			return
-		}
+	})
+
+	// Кнопки одинакового размера, в одну строку, по центру (без растягивания).
+	bw := cancel.MinSize().Width
+	if cw := compare.MinSize().Width; cw > bw {
+		bw = cw
+	}
+	bsz := fyne.NewSize(bw, compare.MinSize().Height)
+	buttons := container.NewHBox(
+		layout.NewSpacer(),
+		container.NewGridWrap(bsz, cancel),
+		container.NewGridWrap(bsz, compare),
+		layout.NewSpacer(),
+	)
+
+	content := container.NewBorder(nil, container.NewVBox(status, buttons), nil, nil, tabs)
+	dlg = dialog.NewCustomWithoutButtons("Diff — choose second source (B)", content, parent)
+	dlg.Resize(fyne.NewSize(580, 440))
+
+	// Пока диалог открыт, дроп файла в главное окно идёт во вкладку File диалога.
+	diffDropTarget = func(p string) {
 		tabs.SelectIndex(0)
 		fileTab.SetFilePath(p)
 		fileTab.FlashDropHighlight()
-	})
-
-	win.SetContent(container.NewBorder(nil, container.NewVBox(status, compare), nil, nil, tabs))
-	win.Resize(fyne.NewSize(560, 380))
-	win.Show()
+	}
+	dlg.SetOnClosed(func() { diffDropTarget = nil })
+	dlg.Show()
 }
 
 // openDiffResult показывает два вьювера рядом (A | B) с подсветкой различий,
