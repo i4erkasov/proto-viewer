@@ -6,6 +6,7 @@ toolchain go1.24.11
 
 require (
 	fyne.io/fyne/v2 v2.7.2
+	github.com/bufbuild/protocompile v0.14.1
 	github.com/bytedance/sonic v1.15.0
 	github.com/redis/go-redis/v9 v9.18.0
 	google.golang.org/protobuf v1.36.11
@@ -50,6 +51,7 @@ require (
 	golang.org/x/arch v0.0.0-20210923205945-b76863e36670 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/net v0.35.0 // indirect
+	golang.org/x/sync v0.17.0 // indirect
 	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

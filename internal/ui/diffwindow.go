@@ -15,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/i4erkasov/proto-viewer/assets"
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/ui/tab"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/jsonviewer"
@@ -48,7 +49,7 @@ func openDiffWindow(deps Deps, jsonA string, getProto func() (string, string, st
 	)
 
 	status := widget.NewLabel("")
-	compare := widget.NewButtonWithIcon("Compare", theme.ConfirmIcon(), nil)
+	compare := widget.NewButtonWithIcon("Compare", assets.CompareIcon, nil)
 	compare.Importance = widget.HighImportance
 	compare.OnTapped = func() {
 		root, file, typ, gzip := getProto()

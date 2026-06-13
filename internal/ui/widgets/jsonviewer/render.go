@@ -84,7 +84,7 @@ func isNumberChar(r rune) bool {
 	return unicode.IsDigit(r) || r == '.' || r == 'e' || r == 'E' || r == '+' || r == '-'
 }
 
-func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange, lineBgs []color.Color) []widget.TextGridRow {
+func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange, lineBgs []color.Color, foldGlyphs []rune) []widget.TextGridRow {
 	if len(lines) == 0 {
 		return nil
 	}
@@ -95,7 +95,12 @@ func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]high
 		prefix := ""
 		if srcLines != nil && i < len(srcLines) {
 			lineNum := srcLines[i] + 1
-			prefix = fmt.Sprintf("%*d  ", lineNumWidth, lineNum)
+			// Гаттер: номер строки + глиф сворачивания (▸/▾) или пробел.
+			glyph := ' '
+			if i < len(foldGlyphs) && foldGlyphs[i] != 0 {
+				glyph = foldGlyphs[i]
+			}
+			prefix = fmt.Sprintf("%*d ", lineNumWidth, lineNum) + string(glyph) + " "
 			if highlights != nil {
 				hl = highlights[srcLines[i]]
 			}
@@ -668,5 +673,23 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 		}
 	}
 
-	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans, lineBgs)
+	// Глифы сворачивания: ▸ для свёрнутого узла, ▾ для развёрнутого.
+	foldGlyphs := make([]rune, len(lineBytes))
+	v.mu.Lock()
+	for i := range lineBytes {
+		if i >= len(srcLines) {
+			continue
+		}
+		src := srcLines[i]
+		if placeholders != nil && i < len(placeholders) && placeholders[i] {
+			foldGlyphs[i] = '▸'
+			continue
+		}
+		if end, ok := v.foldRanges[src]; ok && end > src && !v.folded[src] {
+			foldGlyphs[i] = '▾'
+		}
+	}
+	v.mu.Unlock()
+
+	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans, lineBgs, foldGlyphs)
 }

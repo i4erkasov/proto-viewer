@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
@@ -24,11 +25,16 @@ func showHelpWindow() {
 	win.Show()
 }
 
-// showAbout показывает простой диалог «О приложении».
+// showAbout показывает диалог «О приложении» с картинкой.
 func showAbout(parent fyne.Window) {
+	img := canvas.NewImageFromResource(assets.AboutImage)
+	img.FillMode = canvas.ImageFillContain
+	img.SetMinSize(fyne.NewSize(160, 160))
+
 	content := container.NewVBox(
+		container.NewCenter(img),
 		widget.NewLabelWithStyle("Proto Viewer", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-		widget.NewLabel("Просмотр и декодирование protobuf-сообщений."),
+		widget.NewLabelWithStyle("View and decode protobuf messages.", fyne.TextAlignCenter, fyne.TextStyle{}),
 	)
 	dialog.ShowCustom("About Proto Viewer", "Close", content, parent)
 }

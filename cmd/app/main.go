@@ -20,7 +20,7 @@ func clamp(v, min, max float32) float32 {
 func main() {
 	// Уникальный ID нужен Fyne для Preferences API.
 	a := app.NewWithID("com.i4erkasov.proto-viewer")
-	w := a.NewWindow("Proto Inspector")
+	w := a.NewWindow("Proto Viewer")
 
 	u := bootstrap.New(w)
 	w.SetContent(u.Content())

@@ -28,6 +28,7 @@ import (
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/protopicker"
 	"github.com/i4erkasov/proto-viewer/internal/ui/widgets/searchselect"
 
+	"github.com/i4erkasov/proto-viewer/assets"
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/protoutil"
@@ -800,7 +801,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 
 	// Diff: открывает окно выбора второго источника (action назначается ниже,
 	// когда доступен getProto).
-	btnDiff := widget.NewButtonWithIcon("", theme.DocumentIcon(), nil)
+	btnDiff := widget.NewButtonWithIcon("", assets.DiffIcon, nil)
 	btnDiff.Importance = widget.LowImportance
 
 	// Overlay buttons (same spot) so we don't reparent output tabs.
@@ -815,7 +816,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	// Header removed: search is now above output.
 
 	// Decode button (wiring TODO - placeholder to keep layout stable)
-	btnDecode := widget.NewButtonWithIcon("Decode", theme.ConfirmIcon(), nil)
+	btnDecode := widget.NewButtonWithIcon("Decode", assets.ConvertIcon, nil)
 	btnDecode.Importance = widget.MediumImportance
 	btnDecode.OnTapped = func() {
 		lblStatus.SetText("Status: decoding…")
@@ -1259,7 +1260,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	settingsMenu := fyne.NewMenu("Settings", enableLogs)
 
 	// Help: документация + About.
-	docItem := fyne.NewMenuItem("Documentation", func() {
+	docItem := fyne.NewMenuItem("Proto Viewer Help", func() {
 		showHelpWindow()
 	})
 	aboutItem := fyne.NewMenuItem("About Proto Viewer", func() {

@@ -46,9 +46,13 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 
 	prefixLen := 0
 	if lineNumWidth > 0 {
-		prefixLen = lineNumWidth + 2
+		prefixLen = lineNumWidth + 3
 	}
 	if col < prefixLen {
+		// Клик по глифу сворачивания (колонка номера+1) — переключить фолд.
+		if lineNumWidth > 0 && col == lineNumWidth+1 && v.toggleFold(srcLine) {
+			return
+		}
 		v.clearSelectedKey()
 		v.clearSelectedValue()
 		v.refreshSelection()
@@ -67,21 +71,25 @@ func (v *JSONView) handleTap(pos fyne.Position) {
 		v.refreshSelection()
 		return
 	}
+	if !v.toggleFold(srcLine) {
+		v.refreshSelection()
+	}
+}
 
+// toggleFold переключает свёрнутость узла, начинающегося со строки srcLine.
+// Возвращает false, если строка не является сворачиваемым узлом.
+func (v *JSONView) toggleFold(srcLine int) bool {
 	v.mu.Lock()
 	end, ok := v.foldRanges[srcLine]
 	if !ok || end <= srcLine {
 		v.mu.Unlock()
-		v.refreshSelection()
-		return
+		return false
 	}
 	v.folded[srcLine] = !v.folded[srcLine]
 	v.rebuildCurrentViewLocked()
 	v.mu.Unlock()
-
-	// Виртуализация: общая высота контента пересчитывается из нового viewLines,
-	// текущая позиция прокрутки сохраняется, перерисовываем видимое окно.
 	v.updateWindow()
+	return true
 }
 
 func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
@@ -106,7 +114,7 @@ func (v *JSONView) handleSecondaryTap(pos fyne.Position) {
 
 	prefixLen := 0
 	if lineNumWidth > 0 {
-		prefixLen = lineNumWidth + 2
+		prefixLen = lineNumWidth + 3
 	}
 	if col < prefixLen {
 		return

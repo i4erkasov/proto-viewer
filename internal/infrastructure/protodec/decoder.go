@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
+	"github.com/bufbuild/protocompile"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
@@ -22,7 +25,6 @@ import (
 
 	"github.com/i4erkasov/proto-viewer/internal/domain"
 	"github.com/i4erkasov/proto-viewer/internal/infrastructure/perf"
-	"github.com/i4erkasov/proto-viewer/internal/infrastructure/protocbin"
 )
 
 type Decoder struct{}
@@ -142,51 +144,42 @@ func compileDescriptorSet(ctx context.Context, protoRoot, protoAbs string) (*des
 	return fds, nil
 }
 
-// runProtocDescriptorSet компилирует .proto в FileDescriptorSet через protoc.
+// runProtocDescriptorSet компилирует .proto в FileDescriptorSet прямо в процессе
+// через protocompile (без внешнего protoc). Возвращает набор со всеми импортами
+// (аналог protoc --include_imports).
 func runProtocDescriptorSet(ctx context.Context, protoRoot, relProto string) (*descriptorpb.FileDescriptorSet, error) {
-	tmp, err := os.CreateTemp("", "protoset-*.pb")
+	stop := perf.Track("compile descriptor_set (" + relProto + ")")
+	defer stop()
+
+	compiler := protocompile.Compiler{
+		Resolver: protocompile.WithStandardImports(&protocompile.SourceResolver{
+			ImportPaths: []string{protoRoot},
+		}),
+		SourceInfoMode: protocompile.SourceInfoNone,
+	}
+	files, err := compiler.Compile(ctx, relProto)
 	if err != nil {
 		return nil, err
 	}
-	tmpPath := tmp.Name()
-	_ = tmp.Close()
-	defer func() { _ = os.Remove(tmpPath) }()
 
-	protocPath, err := protocbin.Ensure()
-	if err != nil {
-		return nil, err
-	}
-
-	args := []string{
-		"-I=" + protoRoot,
-		"--include_imports",
-		"--descriptor_set_out=" + tmpPath,
-		relProto,
-	}
-	cmd := exec.CommandContext(ctx, protocPath, args...)
-	hideWindow(cmd)
-	var errBuf bytes.Buffer
-	cmd.Stderr = &errBuf
-	stopProtoc := perf.Track("protoc descriptor_set (" + relProto + ")")
-	runErr := cmd.Run()
-	stopProtoc()
-	if runErr != nil {
-		stderr := strings.TrimSpace(errBuf.String())
-		if stderr == "" {
-			stderr = runErr.Error()
+	fds := &descriptorpb.FileDescriptorSet{}
+	seen := make(map[string]bool)
+	var add func(fd protoreflect.FileDescriptor)
+	add = func(fd protoreflect.FileDescriptor) {
+		if seen[fd.Path()] {
+			return
 		}
-		return nil, fmt.Errorf("%s", stderr)
+		seen[fd.Path()] = true
+		imps := fd.Imports()
+		for i := 0; i < imps.Len(); i++ {
+			add(imps.Get(i).FileDescriptor)
+		}
+		fds.File = append(fds.File, protodesc.ToFileDescriptorProto(fd))
 	}
-
-	b, err := os.ReadFile(tmpPath)
-	if err != nil {
-		return nil, err
+	for _, f := range files {
+		add(f)
 	}
-	var fds descriptorpb.FileDescriptorSet
-	if err := proto.Unmarshal(b, &fds); err != nil {
-		return nil, err
-	}
-	return &fds, nil
+	return fds, nil
 }
 
 func (d *Decoder) ValidateMessageType(ctx context.Context, protoRoot, fullType, protoAbs string) error {
@@ -252,27 +245,98 @@ func decodeJSON(ctx context.Context, protoRoot, fullType, protoAbs string, binBy
 	return string(b), nil
 }
 
-func decodeRaw(ctx context.Context, binBytes []byte) (string, error) {
-	protocPath, err := protocbin.Ensure()
-	if err != nil {
+// decodeRaw разбирает сырые protobuf-байты без схемы (аналог protoc --decode_raw),
+// прямо в процессе через protowire.
+func decodeRaw(_ context.Context, binBytes []byte) (string, error) {
+	var sb strings.Builder
+	if err := dumpRawFields(&sb, binBytes, 0); err != nil {
 		return "", err
 	}
-	cmd := exec.CommandContext(ctx, protocPath, "--decode_raw")
-	hideWindow(cmd)
-	cmd.Stdin = bytes.NewReader(binBytes)
+	return sb.String(), nil
+}
 
-	var out bytes.Buffer
-	var errBuf bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		s := strings.TrimSpace(errBuf.String())
-		if s == "" {
-			s = err.Error()
-		}
-		return "", fmt.Errorf("%s", s)
+// isProbablyText сообщает, выглядят ли байты как печатный UTF-8 текст
+// (для RAW предпочитаем показать строку, а не пытаться разобрать как сообщение).
+func isProbablyText(v []byte) bool {
+	if len(v) == 0 {
+		return true
 	}
-	return out.String(), nil
+	if !utf8.Valid(v) {
+		return false
+	}
+	for _, r := range string(v) {
+		if r == '\t' || r == '\n' || r == '\r' {
+			continue
+		}
+		if !unicode.IsPrint(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func dumpRawFields(sb *strings.Builder, b []byte, depth int) error {
+	if depth > 100 {
+		return fmt.Errorf("nesting too deep")
+	}
+	pad := strings.Repeat("  ", depth)
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return protowire.ParseError(n)
+		}
+		b = b[n:]
+		switch typ {
+		case protowire.VarintType:
+			v, n := protowire.ConsumeVarint(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			fmt.Fprintf(sb, "%s%d: %d\n", pad, num, v)
+		case protowire.Fixed32Type:
+			v, n := protowire.ConsumeFixed32(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			fmt.Fprintf(sb, "%s%d: 0x%08x\n", pad, num, v)
+		case protowire.Fixed64Type:
+			v, n := protowire.ConsumeFixed64(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			fmt.Fprintf(sb, "%s%d: 0x%016x\n", pad, num, v)
+		case protowire.BytesType:
+			v, n := protowire.ConsumeBytes(b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			var nested strings.Builder
+			switch {
+			case isProbablyText(v):
+				fmt.Fprintf(sb, "%s%d: %q\n", pad, num, string(v))
+			case len(v) > 0 && dumpRawFields(&nested, v, depth+1) == nil:
+				fmt.Fprintf(sb, "%s%d: {\n%s%s}\n", pad, num, nested.String(), pad)
+			default:
+				fmt.Fprintf(sb, "%s%d: %x\n", pad, num, v)
+			}
+		case protowire.StartGroupType:
+			v, n := protowire.ConsumeGroup(num, b)
+			if n < 0 {
+				return protowire.ParseError(n)
+			}
+			b = b[n:]
+			var nested strings.Builder
+			_ = dumpRawFields(&nested, v, depth+1)
+			fmt.Fprintf(sb, "%s%d: {\n%s%s}\n", pad, num, nested.String(), pad)
+		default:
+			return fmt.Errorf("unknown wire type %d", typ)
+		}
+	}
+	return nil
 }
 
 func (d *Decoder) Decode(ctx context.Context, req domain.DecodeRequest) (domain.DecodeResult, error) {

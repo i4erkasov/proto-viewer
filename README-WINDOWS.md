@@ -1,114 +1,51 @@
-# Windows build (installer + embedded protoc)
+# Build & distribution
 
-This app uses **Fyne**.
+This app uses **Fyne**. It builds for **macOS, Linux and Windows**.
 
-## Goal: share with non-developers
+> **protoc больше не нужен.** Раньше для Windows вшивался бинарь `protoc`;
+> теперь `.proto` компилируется в процессе через `bufbuild/protocompile`
+> (Go-библиотека). Ничего ставить/вшивать/скачивать не требуется ни на одной ОС.
 
-You have 2 practical delivery formats:
+## CI (рекомендуется)
 
-### 1) Portable build (recommended for internal sharing)
+Сборка под все платформы автоматизирована в GitHub Actions —
+`.github/workflows/build.yml` (матрица `ubuntu-latest` / `macos-latest` /
+`windows-latest`). Каждый раннер:
 
-Give colleagues a single folder or zip:
+1. ставит Go (версия из `go.mod`) и Fyne CLI;
+2. (Linux) ставит GUI-зависимости: `libgl1-mesa-dev xorg-dev libxcursor-dev
+   libxrandr-dev libxinerama-dev libxi-dev libxxf86vm-dev`;
+3. `go build ./...` + `go test ./internal/...`;
+4. `fyne package --os <linux|darwin|windows>`;
+5. выкладывает артефакт (`.tar.xz` / `.app`→zip / `.exe`).
 
-- `Proto Viewer.exe`
-- (optionally) a `README.txt`
+Запуск: вкладка **Actions → build → Run workflow** (или push в `main`).
+Готовые сборки скачиваются из артефактов джоба.
 
-They unzip and run `Proto Viewer.exe`.
+## Локальная сборка
 
-### 2) Installer (recommended for wider distribution)
+Поставить Fyne CLI:
 
-Generate an installer (MSI/EXE). Colleagues run the installer and then launch the app from Start Menu.
+```
+go install fyne.io/tools/cmd/fyne@latest
+```
 
----
+Собрать пакет под текущую ОС:
 
-## What about `protoc`?
+```
+fyne package --os darwin  --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon assets/icon.png
+fyne package --os linux   --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon assets/icon.png
+fyne package --os windows --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon assets/icon.png
+```
 
-- **Windows**: `protoc` is embedded in the app build as `internal/infrastructure/protocbin/protoc_windows_amd64.zip`.
-  On first use it’s unpacked to:
+Кросс-компиляция Fyne между ОС болезненна (GUI-тулчейн, OpenGL, CGO) —
+собирай **на целевой ОС** (или в соответствующем раннере CI).
 
-  `%LOCALAPPDATA%\proto-viewer\protoc\<hash>\bin\protoc.exe`
+### Linux: зависимости для сборки
+Нужны dev-пакеты OpenGL/X11 (см. список выше). Для запуска у пользователя —
+обычные GL-драйверы (как правило уже есть).
 
-  and used automatically (no admin rights needed).
-
-- **macOS/Linux**: we currently rely on `protoc` being available in `PATH` (keeps repo size smaller).
-
-> Important: in this repository the zip is intentionally committed as an **empty placeholder** (0 bytes), to avoid shipping binaries.
-> If your CI checks for a non-empty file (recommended), you must provide a real `protoc` zip at build time.
-
-## Provide protoc zip (Windows)
-
-### Option A (simplest): commit the real zip
-
-1. Download the official protoc Windows archive from Google:
-   `protoc-<version>-win64.zip`
-2. Copy it into:
-   `internal/infrastructure/protocbin/protoc_windows_amd64.zip`
-
-Now both local Windows builds and CI will pass the “non-empty zip” check.
-
-### Option B (recommended for CI): download protoc zip in the pipeline
-
-Don’t commit binaries. Instead, in your Windows GitHub Actions job:
-
-1. Download `protoc-<version>-win64.zip`.
-2. Save it into `internal/infrastructure/protocbin/protoc_windows_amd64.zip`.
-3. Continue with `fyne package ...`.
-
-If you can’t fetch it from the internet (restricted network), store the zip as a workflow artifact, a release asset, or in internal storage.
-
----
-
-## Build Windows `.exe` (build on Windows)
-
-Cross-compiling Fyne apps from macOS to Windows is often painful (GUI toolchain, OpenGL, CGO).
-The recommended way is to build **on Windows** (or in a Windows CI runner).
-
-### Prerequisites on Windows
-
-- Go
-- A C compiler required by Fyne (MSYS2 / mingw-w64 is the common choice)
-- Fyne CLI:
-
-  `go install fyne.io/fyne/v2/cmd/fyne@latest`
-
-### Build executable
-
-From repo root:
-
-- `fyne package -os windows -icon assets/icon.png -name "Proto Viewer" -appID com.i4erkasov.proto-viewer`
-
-This produces a Windows executable (name/output location depends on Fyne version).
-
----
-
-## Build an installer
-
-### Option A: Fyne packaging (simplest)
-
-Run on Windows:
-
-- `fyne package -os windows -name "Proto Viewer" -appID com.i4erkasov.proto-viewer -icon assets/icon.png`
-
-Depending on your environment/tooling, Fyne can output an installer (MSI/EXE) or a packaged app.
-
-### Option B: WiX / Inno Setup (most control)
-
-If you need a custom install path, extra files, shortcuts etc:
-
-- **WiX Toolset** (MSI)
-- **Inno Setup** (EXE)
-
-In both cases you ship `Proto Viewer.exe` + assets (if any). `protoc` is already embedded and will be unpacked automatically at runtime.
-
----
-
-## CI option (recommended)
-
-If you don’t want to build on your local Windows machine:
-
-- Use a Windows GitHub Actions runner
-- Download/provide `protoc_windows_amd64.zip` during the job (see Option B)
-- Build with `fyne package -os windows ...`
-- Upload resulting `.exe` and/or installer as workflow artifacts
-
-That way you can send colleagues a download link to a ready-to-run build.
+### macOS: подпись
+`.app` из CI **не подписан** → Gatekeeper покажет предупреждение
+(правый клик → Open, или System Settings → Privacy & Security → Open Anyway).
+Подпись/нотаризация требуют Apple Developer аккаунта — отдельный шаг при необходимости.

@@ -1,0 +1,74 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: ${{ matrix.fyne_os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            fyne_os: linux
+            artifact: proto-viewer-linux
+          - runner: macos-latest
+            fyne_os: darwin
+            artifact: proto-viewer-macos
+          - runner: windows-latest
+            fyne_os: windows
+            artifact: proto-viewer-windows
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Fyne (GLFW/OpenGL, CGO) требует dev-пакетов GUI на Linux.
+      - name: Install Linux GUI deps
+        if: matrix.fyne_os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev xorg-dev libxcursor-dev libxrandr-dev \
+            libxinerama-dev libxi-dev libxxf86vm-dev
+
+      - name: Install Fyne CLI
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Build & test
+        run: |
+          go build ./...
+          go test ./internal/...
+
+      - name: Package
+        run: fyne package --os ${{ matrix.fyne_os }} --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon assets/icon.png
+
+      # .app — это каталог; упаковываем в zip для артефакта.
+      - name: Zip .app (macOS)
+        if: matrix.fyne_os == 'darwin'
+        run: |
+          APP=$(find . -maxdepth 3 -name "*.app" -type d | head -1)
+          if [ -n "$APP" ]; then
+            ditto -c -k --keepParent "$APP" "Proto-Viewer-macos.zip"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            **/*.exe
+            **/*.tar.xz
+            **/*.zip
+            **/*.msi
+          if-no-files-found: warn
