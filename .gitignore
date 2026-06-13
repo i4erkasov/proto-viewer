@@ -16,3 +16,6 @@ decoded.json
 # OS / IDE
 .DS_Store
 .idea/
+
+# Внутренние заметки/планы разработки
+/docs/
