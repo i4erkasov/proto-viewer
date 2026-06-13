@@ -50,8 +50,11 @@ jobs:
           go build ./...
           go test ./internal/...
 
+      # Иконку резолвим абсолютным путём: с --source-dir fyne ищет её
+      # относительно source-dir, а не корня репозитория.
       - name: Package
-        run: fyne package --os ${{ matrix.fyne_os }} --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon assets/icon.png
+        shell: bash
+        run: fyne package --os ${{ matrix.fyne_os }} --source-dir ./cmd/app --name "Proto Viewer" --app-id com.i4erkasov.proto-viewer --icon "$GITHUB_WORKSPACE/assets/icon.png"
 
       # .app — это каталог; упаковываем в zip для артефакта.
       - name: Zip .app (macOS)
