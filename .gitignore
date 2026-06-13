@@ -1,0 +1,18 @@
+# Build artifacts
+/app
+*.exe
+*.test
+
+# Profiling
+*.out
+cpu.out
+mem.out
+
+# Logs / decoded output
+*.log
+log*.txt
+decoded.json
+
+# OS / IDE
+.DS_Store
+.idea/

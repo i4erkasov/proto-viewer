@@ -41,6 +41,7 @@ func (v *JSONView) SetJSON(s string) {
 	v.selectedValueText = ""
 	v.selActive = false
 	v.selecting = false
+	v.diffLines = nil
 	v.mu.Unlock()
 	v.SetSearchVisible(false)
 

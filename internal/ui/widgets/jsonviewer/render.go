@@ -84,7 +84,7 @@ func isNumberChar(r rune) bool {
 	return unicode.IsDigit(r) || r == '.' || r == 'e' || r == 'E' || r == '+' || r == '-'
 }
 
-func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange) []widget.TextGridRow {
+func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange, lineBgs []color.Color) []widget.TextGridRow {
 	if len(lines) == 0 {
 		return nil
 	}
@@ -107,10 +107,14 @@ func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]high
 		if i < len(selSpans) {
 			selBg = selSpans[i]
 		}
+		var lineBg color.Color
+		if i < len(lineBgs) {
+			lineBg = lineBgs[i]
+		}
 		fullLine := make([]byte, 0, len(prefix)+len(line))
 		fullLine = append(fullLine, prefix...)
 		fullLine = append(fullLine, line...)
-		cells := buildTextGridCells(fullLine, hl, len(prefix), sel, selBg)
+		cells := buildTextGridCells(fullLine, hl, len(prefix), sel, selBg, lineBg)
 		rows = append(rows, widget.TextGridRow{Cells: cells})
 	}
 	return rows
@@ -145,7 +149,7 @@ func cellStyle(fg, bg color.Color, bold bool) *widget.CustomTextGridStyle {
 	return s
 }
 
-func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange, selBg highlightRange) []widget.TextGridCell {
+func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange, selBg highlightRange, lineBg color.Color) []widget.TextGridCell {
 	if len(line) == 0 {
 		return nil
 	}
@@ -229,6 +233,7 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 				bg = lnBg
 			} else {
 				cc := dispCol - prefixRuneLen
+				bg = lineBg // базовый фон строки (diff); перекрывается выделением/поиском
 				switch {
 				case hasSel && cc >= selBg.start && cc < selBg.end:
 					bg = selColor // выделение текста перекрывает подсветку поиска
@@ -583,6 +588,34 @@ func intersectSortedInts(a, b []int) []int {
 	return out
 }
 
+// SetDiffLines задаёт фон строк по индексу исходной строки (режим Diff).
+// nil/пустая карта снимает подсветку. Перерисовывает видимое окно.
+func (v *JSONView) SetDiffLines(m map[int]color.Color) {
+	v.mu.Lock()
+	v.diffLines = m
+	v.mu.Unlock()
+	v.updateWindow()
+}
+
+// ScrollToSourceLine прокручивает к строке исходного JSON. Если строка скрыта
+// внутри свёрнутого узла — разворачивает узлы по пути к ней.
+func (v *JSONView) ScrollToSourceLine(src int) {
+	v.mu.Lock()
+	row := findViewRow(v.viewLines, src)
+	if row < 0 {
+		if v.expandForLineLocked(src) {
+			v.rebuildCurrentViewLocked()
+			row = findViewRow(v.viewLines, src)
+		}
+	}
+	v.mu.Unlock()
+	if row < 0 {
+		return
+	}
+	v.updateWindow()
+	v.scrollToViewRow(row)
+}
+
 // buildRowsForView builds TextGrid rows for the given view lines, applying the
 // current search highlights and selection. Safe to call off the UI thread.
 func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
@@ -599,6 +632,7 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 	buf := v.fullBuf
 	winStart := v.winStart
 	selActive := v.selActive
+	diffLines := v.diffLines
 	v.mu.Unlock()
 
 	lineBytes, srcLines, placeholders := buildViewLineBytes(buf, viewLines)
@@ -621,5 +655,18 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 		v.mu.Unlock()
 	}
 
-	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans)
+	// Фон строк по diff (красный/зелёный) — по индексу исходной строки.
+	var lineBgs []color.Color
+	if len(diffLines) > 0 {
+		lineBgs = make([]color.Color, len(lineBytes))
+		for i := range lineBytes {
+			if i < len(srcLines) {
+				if c, ok := diffLines[srcLines[i]]; ok {
+					lineBgs[i] = c
+				}
+			}
+		}
+	}
+
+	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans, lineBgs)
 }

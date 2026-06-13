@@ -241,21 +241,6 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 
 	registerSearchShortcuts(w.Canvas(), setSearchVisible, func() bool { return jsonTree.SearchVisible() })
 	registerSearchShortcuts(w.Canvas(), setJSONSearchVisible, func() bool { return jsonMarkdown.SearchVisible() })
-	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
-		// Esc работает независимо от фокуса: сначала закрываем пресет-диалог,
-		// иначе скрываем открытый поиск.
-		if loadPresetDialog != nil {
-			closeLoadPresetDialog()
-			return
-		}
-		if jsonMarkdown.SearchVisible() {
-			setJSONSearchVisible(false)
-			return
-		}
-		if jsonTree.SearchVisible() {
-			setSearchVisible(false)
-		}
-	})
 	w.Canvas().AddShortcut(&fyne.ShortcutCopy{}, func(_ fyne.Shortcut) {
 		if isTreeTab() {
 			v := jsonTree.SelectedValueString()
@@ -909,6 +894,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 
 			payload, err := src.Fetch(ctx)
 			if err != nil {
+				perf.Log("fetch error: %v", err)
 				fyne.Do(func() {
 					lblStatus.SetText("Status: error")
 					dialog.ShowError(err, w)
@@ -957,6 +943,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			})
 			stopDecode()
 			if err != nil {
+				perf.Log("decode error: %v", err)
 				fyne.Do(func() {
 					lblStatus.SetText("Status: error")
 					dialog.ShowError(err, w)
@@ -1082,8 +1069,140 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	// Layout: keep outputStack in a single container to avoid reparenting issues.
 	contentArea := container.NewBorder(sourceTabs, nil, nil, nil, resultPanel)
 
+	// Diff mode: две стороны (переиспользуемый sidePanel) с общими proto-настройками.
+	getProto := func() (string, string, string, bool) {
+		return strings.TrimSpace(protoRoot.Text),
+			strings.TrimSpace(protoFile.Text),
+			strings.TrimSpace(typeSelect.Selected()),
+			gzipCheck.Checked
+	}
+	panelA := newSidePanel(w, deps, "A", getProto)
+	panelB := newSidePanel(w, deps, "B", getProto)
+	diffSplit := container.NewHSplit(panelA.View(), panelB.View())
+	diffSplit.SetOffset(0.5)
+
+	// Навигация по различиям.
+	var diffHunks []diffHunk
+	diffIdx := -1
+	diffLabel := widget.NewLabel("no diffs")
+	updateDiffLabel := func() {
+		switch {
+		case len(diffHunks) == 0:
+			diffLabel.SetText("no diffs")
+		case diffIdx < 0:
+			diffLabel.SetText(fmt.Sprintf("%d diffs", len(diffHunks)))
+		default:
+			diffLabel.SetText(fmt.Sprintf("%d/%d", diffIdx+1, len(diffHunks)))
+		}
+	}
+	navDiff := func(step int) {
+		if len(diffHunks) == 0 {
+			return
+		}
+		diffIdx = (diffIdx + step + len(diffHunks)) % len(diffHunks)
+		h := diffHunks[diffIdx]
+		panelA.viewer.ScrollToSourceLine(h.aLine)
+		panelB.viewer.ScrollToSourceLine(h.bLine)
+		updateDiffLabel()
+	}
+
+	// Пересчёт подсветки различий после декода любой стороны.
+	applyDiff := func() {
+		a, b := panelA.json, panelB.json
+		if a == "" || b == "" {
+			panelA.viewer.SetDiffLines(nil)
+			panelB.viewer.SetDiffLines(nil)
+			diffHunks = nil
+			diffIdx = -1
+			updateDiffLabel()
+			return
+		}
+		aDiff, bDiff, hunks := computeLineDiff(strings.Split(a, "\n"), strings.Split(b, "\n"))
+		am := make(map[int]color.Color, len(aDiff))
+		for i := range aDiff {
+			am[i] = diffColorRemoved()
+		}
+		bm := make(map[int]color.Color, len(bDiff))
+		for j := range bDiff {
+			bm[j] = diffColorAdded()
+		}
+		panelA.viewer.SetDiffLines(am)
+		panelB.viewer.SetDiffLines(bm)
+		diffHunks = hunks
+		diffIdx = -1
+		updateDiffLabel()
+	}
+	panelA.onDecoded = applyDiff
+	panelB.onDecoded = applyDiff
+
+	// Панель управления над сплитом: развернуть/свернуть весь JSON + навигация по диффам.
+	btnDiffPrev := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() { navDiff(-1) })
+	btnDiffNext := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() { navDiff(1) })
+	btnDiffPrev.Importance = widget.LowImportance
+	btnDiffNext.Importance = widget.LowImportance
+
+	// Одна кнопка сворачивает/разворачивает источники сразу в обеих сторонах.
+	sourcesHidden := false
+	var btnToggleSources *widget.Button
+	btnToggleSources = widget.NewButton("Hide sources", func() {
+		sourcesHidden = !sourcesHidden
+		panelA.SetSourceVisible(!sourcesHidden)
+		panelB.SetSourceVisible(!sourcesHidden)
+		if sourcesHidden {
+			btnToggleSources.SetText("Show sources")
+		} else {
+			btnToggleSources.SetText("Hide sources")
+		}
+	})
+
+	// Общая кнопка: декодирует обе стороны (из их текущих источников) и сравнивает.
+	btnCompare := widget.NewButtonWithIcon("Compare", theme.ViewRefreshIcon(), func() {
+		panelA.Decode()
+		panelB.Decode()
+	})
+	btnCompare.Importance = widget.HighImportance
+
+	diffBar := container.NewHBox(
+		btnCompare,
+		widget.NewButton("Expand all", func() {
+			panelA.viewer.ExpandAll()
+			panelB.viewer.ExpandAll()
+		}),
+		widget.NewButton("Collapse all", func() {
+			panelA.viewer.CollapseAll()
+			panelB.viewer.CollapseAll()
+		}),
+		btnToggleSources,
+		layout.NewSpacer(),
+		btnDiffPrev, btnDiffNext, diffLabel,
+	)
+	diffBody := container.NewBorder(diffBar, nil, nil, nil, diffSplit)
+
+	// Тело под верхней панелью переключается между обычным выводом и diff-сплитом.
+	body := container.NewStack(contentArea)
+	diffMode := false
+
+	// Синхронная прокрутка двух сторон в режиме Diff (одна прокрутка двигает обе).
+	syncingScroll := false
+	panelA.viewer.OnScrolled = func(p fyne.Position) {
+		if !diffMode || syncingScroll {
+			return
+		}
+		syncingScroll = true
+		panelB.viewer.SetScrollOffset(p)
+		syncingScroll = false
+	}
+	panelB.viewer.OnScrolled = func(p fyne.Position) {
+		if !diffMode || syncingScroll {
+			return
+		}
+		syncingScroll = true
+		panelA.viewer.SetScrollOffset(p)
+		syncingScroll = false
+	}
+
 	// Root
-	normalContent := container.NewBorder(globalBar, nil, nil, nil, contentArea)
+	normalContent := container.NewBorder(globalBar, nil, nil, nil, body)
 
 	btnToggleOutput.OnTapped = func() {
 		isOutputExpanded = !isOutputExpanded
@@ -1127,7 +1246,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	rootC := normalContent
 
 	// ---- Drag & Drop -> заполняем File tab
-	w.SetOnDropped(func(_ fyne.Position, uris []fyne.URI) {
+	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
 		if len(uris) == 0 {
 			return
 		}
@@ -1145,12 +1264,214 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			return
 		}
 
+		// В diff-режиме роутим дроп по горизонтали в нужную сторону.
+		if diffMode {
+			boundary := w.Canvas().Size().Width * float32(diffSplit.Offset)
+			if pos.X < boundary {
+				panelA.DropFile(p)
+			} else {
+				panelB.DropFile(p)
+			}
+			return
+		}
+
 		sourceTabs.SelectIndex(0)
 		fileTab.SetFilePath(p)
 		fileTab.FlashDropHighlight()
 	})
 
-	return rootC
+	// --- Панель логов внизу (perf-логи прямо в приложении).
+	const logCap = 200
+	var (
+		logMu           sync.Mutex
+		logLines        []string
+		logFlushPending bool
+	)
+	logText := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Monospace: true})
+	logText.Wrapping = fyne.TextWrapOff
+	logScroll := container.NewVScroll(logText)
+	logScroll.SetMinSize(fyne.NewSize(0, 160))
+
+	flushLogs := func() {
+		logMu.Lock()
+		txt := strings.Join(logLines, "\n")
+		logMu.Unlock()
+		logText.SetText(txt)
+		logScroll.ScrollToBottom()
+	}
+
+	var logToggleBtn *widget.Button
+	logToggleBtn = widget.NewButtonWithIcon("Logs", theme.MenuDropUpIcon(), func() {
+		if logScroll.Visible() {
+			logScroll.Hide()
+			logToggleBtn.SetIcon(theme.MenuDropDownIcon())
+		} else {
+			logScroll.Show()
+			logToggleBtn.SetIcon(theme.MenuDropUpIcon())
+			flushLogs()
+		}
+	})
+	logToggleBtn.Importance = widget.LowImportance
+	logSaveBtn := widget.NewButtonWithIcon("", theme.DocumentSaveIcon(), func() {
+		logMu.Lock()
+		txt := strings.Join(logLines, "\n")
+		logMu.Unlock()
+		if strings.TrimSpace(txt) == "" {
+			dialog.ShowInformation("Save logs", "Логи пусты", w)
+			return
+		}
+		d := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
+			if err != nil {
+				dialog.ShowError(err, w)
+				return
+			}
+			if wc == nil {
+				return // cancelled
+			}
+			defer func() { _ = wc.Close() }()
+			if _, err := wc.Write([]byte(txt)); err != nil {
+				dialog.ShowError(err, w)
+			}
+		}, w)
+		d.SetFileName("proto-viewer-logs.txt")
+		d.Show()
+	})
+	logSaveBtn.Importance = widget.LowImportance
+	logHeader := container.NewBorder(nil, nil, logToggleBtn, logSaveBtn, layout.NewSpacer())
+	logPanel := container.NewVBox(widget.NewSeparator(), logHeader, logScroll)
+	logPanel.Hide()
+	if perf.Enabled() {
+		perf.LogEnv()
+		logPanel.Show()
+	}
+
+	scheduleLogFlush := func() {
+		logMu.Lock()
+		if logFlushPending {
+			logMu.Unlock()
+			return
+		}
+		logFlushPending = true
+		logMu.Unlock()
+		// Коалесцируем всплески (логи могут идти на каждый кадр скролла).
+		time.AfterFunc(300*time.Millisecond, func() {
+			logMu.Lock()
+			logFlushPending = false
+			logMu.Unlock()
+			fyne.Do(flushLogs)
+		})
+	}
+
+	perf.SetSink(func(line string) {
+		logMu.Lock()
+		logLines = append(logLines, line)
+		if len(logLines) > logCap {
+			logLines = logLines[len(logLines)-logCap:]
+		}
+		logMu.Unlock()
+		scheduleLogFlush()
+	})
+
+	// --- Главное меню окна.
+	// Mode: переключение между обычным просмотром и Diff (две панели).
+	modeViewer := fyne.NewMenuItem("Viewer", nil)
+	modeViewer.Checked = true
+	modeDiff := fyne.NewMenuItem("Diff", nil)
+	modeMenu := fyne.NewMenu("Mode", modeViewer, modeDiff)
+
+	// Settings: включение perf-логов в рантайме (пишутся в stderr).
+	enableLogs := fyne.NewMenuItem("Enable logs", nil)
+	enableLogs.Checked = perf.Enabled()
+	settingsMenu := fyne.NewMenu("Settings", enableLogs)
+
+	// Help: документация + About.
+	docItem := fyne.NewMenuItem("Documentation", func() {
+		showHelpWindow()
+	})
+	aboutItem := fyne.NewMenuItem("About Proto Viewer", func() {
+		showAbout(w)
+	})
+	helpMenu := fyne.NewMenu("Help", docItem, aboutItem)
+
+	mainMenu := fyne.NewMainMenu(modeMenu, settingsMenu, helpMenu)
+
+	setMode := func(diff bool) {
+		diffMode = diff
+		if diff {
+			body.Objects = []fyne.CanvasObject{diffBody}
+		} else {
+			body.Objects = []fyne.CanvasObject{contentArea}
+		}
+		body.Refresh()
+		modeViewer.Checked = !diff
+		modeDiff.Checked = diff
+		w.SetMainMenu(mainMenu) // обновить галочки в нативном меню
+	}
+	modeViewer.Action = func() { setMode(false) }
+	modeDiff.Action = func() { setMode(true) }
+
+	enableLogs.Action = func() {
+		on := !enableLogs.Checked
+		enableLogs.Checked = on
+		perf.SetEnabled(on)
+		// Пересобираем нативное меню, чтобы галочка обновилась.
+		w.SetMainMenu(mainMenu)
+		if on {
+			perf.LogEnv()
+			logPanel.Show()
+			flushLogs()
+			lblStatus.SetText("Status: perf logs ON")
+		} else {
+			logPanel.Hide()
+			lblStatus.SetText("Status: perf logs OFF")
+		}
+	}
+
+	w.SetMainMenu(mainMenu)
+
+	// Cmd/Ctrl+F и Esc с учётом режима: в Diff — поиск в обеих сторонах,
+	// в обычном — главный вьювер. Регистрируется последним, поэтому имеет приоритет.
+	diffFindToggle := func() {
+		show := !(panelA.SearchVisible() || panelB.SearchVisible())
+		panelA.SetSearchVisible(show)
+		panelB.SetSearchVisible(show)
+		if show {
+			panelA.FocusSearch()
+		}
+	}
+	findToggle := func() {
+		if diffMode {
+			diffFindToggle()
+			return
+		}
+		setJSONSearchVisible(!jsonMarkdown.SearchVisible())
+	}
+	for _, mod := range []fyne.KeyModifier{fyne.KeyModifierShortcutDefault, fyne.KeyModifierControl, fyne.KeyModifierSuper} {
+		w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: mod}, func(_ fyne.Shortcut) { findToggle() })
+	}
+	w.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
+		if loadPresetDialog != nil {
+			closeLoadPresetDialog()
+			return
+		}
+		if diffMode {
+			if panelA.SearchVisible() || panelB.SearchVisible() {
+				panelA.SetSearchVisible(false)
+				panelB.SetSearchVisible(false)
+			}
+			return
+		}
+		if jsonMarkdown.SearchVisible() {
+			setJSONSearchVisible(false)
+			return
+		}
+		if jsonTree.SearchVisible() {
+			setSearchVisible(false)
+		}
+	})
+
+	// Панель логов — внизу окна, под основным содержимым.
+	return container.NewBorder(nil, logPanel, nil, nil, rootC)
 }
 
 // (shortcut helpers moved to platform-specific files)

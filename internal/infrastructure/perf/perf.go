@@ -1,30 +1,73 @@
 // Package perf provides lightweight, opt-in timing instrumentation.
 //
 // It is disabled by default and adds no measurable overhead in that state.
-// Set the environment variable PROTO_VIEWER_PERF=1 to enable timing logs to
-// stderr. This is used to separate protoc/decode cost from UI render cost when
-// diagnosing platform-specific slowness (e.g. software OpenGL on Windows).
+// Logging can be toggled at runtime via SetEnabled (e.g. from the Settings
+// menu); the initial value is taken from the environment variable
+// PROTO_VIEWER_PERF (1/true/yes). Logs go to stderr. Used to separate
+// protoc/decode cost from UI render cost when diagnosing platform-specific
+// slowness (e.g. software OpenGL on Windows).
 package perf
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// slowThreshold — операции дольше этого помечаются [SLOW], чтобы в присланном
+// логе легко находить «тормоза» (grep SLOW).
+const slowThreshold = 80 * time.Millisecond
+
 var (
-	enabledOnce sync.Once
-	enabled     bool
+	enabled  atomic.Bool
+	initOnce sync.Once
+
+	sinkMu sync.RWMutex
+	sink   func(string)
 )
+
+// SetSink registers an optional callback that receives every formatted perf
+// line (in addition to stderr). Used to mirror logs into the app's log panel.
+// The callback may be invoked from any goroutine; keep it cheap / non-blocking.
+func SetSink(fn func(string)) {
+	sinkMu.Lock()
+	sink = fn
+	sinkMu.Unlock()
+}
+
+func emit(line string) {
+	log.Print(line)
+	sinkMu.RLock()
+	fn := sink
+	sinkMu.RUnlock()
+	if fn != nil {
+		fn(line)
+	}
+}
+
+func initFromEnv() {
+	initOnce.Do(func() {
+		v := os.Getenv("PROTO_VIEWER_PERF")
+		if v == "1" || v == "true" || v == "yes" {
+			enabled.Store(true)
+		}
+	})
+}
 
 // Enabled reports whether perf logging is turned on.
 func Enabled() bool {
-	enabledOnce.Do(func() {
-		v := os.Getenv("PROTO_VIEWER_PERF")
-		enabled = v == "1" || v == "true" || v == "yes"
-	})
-	return enabled
+	initFromEnv()
+	return enabled.Load()
+}
+
+// SetEnabled turns perf logging on or off at runtime. Safe for concurrent use.
+func SetEnabled(on bool) {
+	initFromEnv()
+	enabled.Store(on)
 }
 
 // Track returns a function that, when called, logs the elapsed time since
@@ -36,8 +79,19 @@ func Track(label string) func() {
 	}
 	start := time.Now()
 	return func() {
-		log.Printf("[perf] %s took %s", label, time.Since(start))
+		d := time.Since(start)
+		if d >= slowThreshold {
+			emit(fmt.Sprintf("[perf][SLOW] %s took %s", label, d))
+		} else {
+			emit(fmt.Sprintf("[perf] %s took %s", label, d))
+		}
 	}
+}
+
+// LogEnv пишет в лог сведения об окружении (для разбора багов на чужой машине).
+func LogEnv() {
+	Log("env: os=%s arch=%s cpu=%d gomaxprocs=%d go=%s",
+		runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), runtime.GOMAXPROCS(0), runtime.Version())
 }
 
 // Log emits a perf message only when perf logging is enabled.
@@ -45,5 +99,5 @@ func Log(format string, args ...any) {
 	if !Enabled() {
 		return
 	}
-	log.Printf("[perf] "+format, args...)
+	emit("[perf] " + fmt.Sprintf(format, args...))
 }

@@ -3,6 +3,7 @@
 package jsonviewer
 
 import (
+	"image/color"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,9 @@ type JSONView struct {
 	content *fyne.Container
 	win     fyne.Window
 
+	// OnScrolled вызывается при прокрутке (для синхронной прокрутки в Diff).
+	OnScrolled func(fyne.Position)
+
 	fullBuf *JSONBuffer
 
 	searchEntry      *escEntry
@@ -49,6 +53,7 @@ type JSONView struct {
 	searchWrap       *fyne.Container
 	searchStructChk  *widget.Check
 	searchStructWrap *fyne.Container
+	hideOnlyMatches  bool
 	searchWidth      float32
 	searchQuery      string
 	matchLines       []int
@@ -72,6 +77,9 @@ type JSONView struct {
 	selAnchorCol int
 	selCurRow    int
 	selCurCol    int
+
+	// diffLines: фон по индексу исходной строки (режим Diff).
+	diffLines map[int]color.Color
 
 	searchKeySelect  *searchselect.SearchableSelect
 	searchKeyWidth   float32
@@ -279,18 +287,33 @@ func (v *JSONView) SetSearchWidth(w float32) {
 	entryWrap := container.NewGridWrap(fyne.NewSize(entryW, entryH), entryStack)
 
 	searchRow := container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
-	checkRow := container.NewHBox(layout.NewSpacer(), v.searchStructWrap)
 	rowH := entryH
+	searchRow.Resize(fyne.NewSize(w, rowH))
+
+	if v.hideOnlyMatches {
+		// Без чекбокса «Only matches» (например, в режиме Diff).
+		v.searchWrap.Objects = []fyne.CanvasObject{searchRow}
+		v.searchWrap.Resize(fyne.NewSize(w, rowH))
+		v.searchWrap.Refresh()
+		return
+	}
+
+	checkRow := container.NewHBox(layout.NewSpacer(), v.searchStructWrap)
 	checkH := v.searchStructWrap.MinSize().Height
 	if checkH < rowH {
 		checkH = rowH
 	}
-	searchRow.Resize(fyne.NewSize(w, rowH))
 	checkRow.Resize(fyne.NewSize(w, checkH))
 
 	v.searchWrap.Objects = []fyne.CanvasObject{searchRow, checkRow}
 	v.searchWrap.Resize(fyne.NewSize(w, rowH+checkH))
 	v.searchWrap.Refresh()
+}
+
+// SetOnlyMatchesVisible управляет видимостью чекбокса «Only matches».
+func (v *JSONView) SetOnlyMatchesVisible(show bool) {
+	v.hideOnlyMatches = !show
+	v.SetSearchWidth(v.searchWidth)
 }
 
 // SetSearchVisible shows or hides the search bar and clears query when hidden.
