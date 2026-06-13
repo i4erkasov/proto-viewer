@@ -54,6 +54,7 @@ type JSONView struct {
 	searchStructChk  *widget.Check
 	searchStructWrap *fyne.Container
 	hideOnlyMatches  bool
+	hideKeySelect    bool
 	searchWidth      float32
 	searchQuery      string
 	matchLines       []int
@@ -270,11 +271,9 @@ func (v *JSONView) SetSearchWidth(w float32) {
 	if entryW < 0 {
 		entryW = minEntryW
 	}
-
-	keyWrap := container.NewGridWrap(
-		fyne.NewSize(keyW, v.searchEntry.MinSize().Height),
-		v.searchKeySelect,
-	)
+	if v.hideKeySelect {
+		entryW = avail // без «Select key» поле занимает всю ширину
+	}
 
 	entryH := v.searchEntry.MinSize().Height
 	padW := float32(0)
@@ -286,7 +285,16 @@ func (v *JSONView) SetSearchWidth(w float32) {
 	entryStack := container.NewStack(entryLayer, container.NewBorder(nil, nil, nil, v.searchNavWrap, layout.NewSpacer()))
 	entryWrap := container.NewGridWrap(fyne.NewSize(entryW, entryH), entryStack)
 
-	searchRow := container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
+	var searchRow *fyne.Container
+	if v.hideKeySelect {
+		searchRow = container.NewHBox(layout.NewSpacer(), entryWrap)
+	} else {
+		keyWrap := container.NewGridWrap(
+			fyne.NewSize(keyW, v.searchEntry.MinSize().Height),
+			v.searchKeySelect,
+		)
+		searchRow = container.NewHBox(layout.NewSpacer(), keyWrap, entryWrap)
+	}
 	rowH := entryH
 	searchRow.Resize(fyne.NewSize(w, rowH))
 
@@ -313,6 +321,12 @@ func (v *JSONView) SetSearchWidth(w float32) {
 // SetOnlyMatchesVisible управляет видимостью чекбокса «Only matches».
 func (v *JSONView) SetOnlyMatchesVisible(show bool) {
 	v.hideOnlyMatches = !show
+	v.SetSearchWidth(v.searchWidth)
+}
+
+// SetKeySelectVisible управляет видимостью выпадающего «Select key» в поиске.
+func (v *JSONView) SetKeySelectVisible(show bool) {
+	v.hideKeySelect = !show
 	v.SetSearchWidth(v.searchWidth)
 }
 
