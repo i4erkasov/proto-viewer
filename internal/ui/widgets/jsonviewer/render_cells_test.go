@@ -18,7 +18,7 @@ func TestBuildCellsMultibyte(t *testing.T) {
 		`  "ko": "더 경기하고."`,
 	}
 	for _, line := range cases {
-		cells := buildTextGridCells([]byte(line), nil, 0, highlightRange{}, highlightRange{}, nil)
+		cells := buildTextGridCells([]byte(line), nil, 0, highlightRange{}, highlightRange{}, nil, highlightRange{}, nil)
 		var sb strings.Builder
 		for _, c := range cells {
 			sb.WriteRune(c.Rune)
@@ -38,7 +38,7 @@ func TestBuildCellsLineNumberPrefix(t *testing.T) {
 	prefix := " 12  "
 	content := `"ru": "БОЛЬШЕ"`
 	full := prefix + content
-	cells := buildTextGridCells([]byte(full), nil, len(prefix), highlightRange{}, highlightRange{}, nil)
+	cells := buildTextGridCells([]byte(full), nil, len(prefix), highlightRange{}, highlightRange{}, nil, highlightRange{}, nil)
 
 	var sb strings.Builder
 	for _, c := range cells {

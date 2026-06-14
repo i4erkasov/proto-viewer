@@ -41,6 +41,10 @@ type JSONView struct {
 	// OnScrolled вызывается при прокрутке (для синхронной прокрутки в Diff).
 	OnScrolled func(fyne.Position)
 
+	// OnSearchResult вызывается (в UI-потоке) после завершения поиска с числом
+	// совпадений — для внешней строки поиска (единый поиск в Diff).
+	OnSearchResult func(matches int)
+
 	fullBuf *JSONBuffer
 
 	searchEntry      *escEntry
@@ -81,6 +85,10 @@ type JSONView struct {
 
 	// diffLines: фон по индексу исходной строки (режим Diff).
 	diffLines map[int]color.Color
+	// diffSpans: рунный диапазон [start,end) изменившейся части строки (A2 —
+	// внутристрочная подсветка), diffSpanColor — её цвет.
+	diffSpans     map[int]highlightRange
+	diffSpanColor color.Color
 
 	searchKeySelect  *searchselect.SearchableSelect
 	searchKeyWidth   float32

@@ -68,6 +68,25 @@ func TestComputeLineDiffHunks(t *testing.T) {
 	}
 }
 
+// TestIntraLineSpans проверяет вычисление изменившейся середины строки (A2).
+func TestIntraLineSpans(t *testing.T) {
+	// Меняется значение в конце: подсвечиваем "88" → "91".
+	ar, br := intraLineSpans(`  "rating": 88`, `  "rating": 91`)
+	if ar != [2]int{12, 14} || br != [2]int{12, 14} {
+		t.Fatalf("rating spans = %v / %v, want [12 14] / [12 14]", ar, br)
+	}
+	// Разная длина середины: "XYZ" → "Q".
+	ar, br = intraLineSpans("abcXYZdef", "abcQdef")
+	if ar != [2]int{3, 6} || br != [2]int{3, 4} {
+		t.Fatalf("mid spans = %v / %v, want [3 6] / [3 4]", ar, br)
+	}
+	// Идентичные строки → пустые диапазоны.
+	ar, br = intraLineSpans("same", "same")
+	if ar[1] > ar[0] || br[1] > br[0] {
+		t.Fatalf("identical lines must yield empty spans, got %v / %v", ar, br)
+	}
+}
+
 // TestDiffSummary проверяет классификацию хунков: изменено/добавлено/удалено.
 func TestDiffSummary(t *testing.T) {
 	// Три участка, разделённые общими строками: изменение, удаление, добавление.

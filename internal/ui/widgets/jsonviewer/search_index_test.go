@@ -25,6 +25,24 @@ func TestSearchFindsAllOccurrences(t *testing.T) {
 	}
 }
 
+// TestSearchCaseInsensitiveUpper — запрос ≥4 символов по тексту в ВЕРХНЕМ
+// регистре (был баг: «якорь» искал lowercase-байт в сыром тексте → промах).
+func TestSearchCaseInsensitiveUpper(t *testing.T) {
+	v := newTestView()
+	v.SetJSON(`{"name":"SALAH","note":"salah too"}`)
+
+	v.applySearchAsync("salah")
+	waitForSearch(v, "salah", 2*time.Second)
+
+	v.mu.Lock()
+	n := len(v.searchMatchSet)
+	v.mu.Unlock()
+	// Обе строки содержат "salah" без учёта регистра.
+	if n != 2 {
+		t.Fatalf("expected 2 case-insensitive matches, got %d", n)
+	}
+}
+
 // TestSearchShortQuery проверяет короткий запрос (< 3 символов, без триграмм).
 func TestSearchShortQuery(t *testing.T) {
 	v := newTestView()

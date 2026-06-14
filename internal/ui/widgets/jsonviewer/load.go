@@ -42,6 +42,7 @@ func (v *JSONView) SetJSON(s string) {
 	v.selActive = false
 	v.selecting = false
 	v.diffLines = nil
+	v.diffSpans = nil
 	v.mu.Unlock()
 	v.SetSearchVisible(false)
 

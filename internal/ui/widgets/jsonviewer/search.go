@@ -79,14 +79,23 @@ func (v *JSONView) applySearchAsync(q string) {
 			v.mu.Unlock()
 			v.updateNavButtons()
 			v.updateWindow()
+			v.fireSearchResult(0)
 		})
 		return
 	}
 
-	anchorByte := byte(0)
+	// Якорь — быстрый отсев строк до полного регистронезависимого сравнения.
+	// queryLower уже в нижнем регистре, а строки сырые → проверяем обе раскладки
+	// якорного байта, иначе для текста в ВЕРХНЕМ регистре будет ложный промах.
+	anchorLo := byte(0)
+	anchorHi := byte(0)
 	useAnchor := len(queryLower) >= 4
 	if useAnchor {
-		anchorByte = queryLower[len(queryLower)/2]
+		anchorLo = queryLower[len(queryLower)/2]
+		anchorHi = anchorLo
+		if anchorLo >= 'a' && anchorLo <= 'z' {
+			anchorHi = anchorLo - 32 // верхний регистр
+		}
 	}
 
 	var candidates []int
@@ -112,7 +121,7 @@ func (v *JSONView) applySearchAsync(q string) {
 			if len(lineBytes) == 0 {
 				continue
 			}
-			if useAnchor && bytes.IndexByte(lineBytes, anchorByte) < 0 {
+			if useAnchor && bytes.IndexByte(lineBytes, anchorLo) < 0 && bytes.IndexByte(lineBytes, anchorHi) < 0 {
 				continue
 			}
 			if !containsFoldASCII(lineBytes, queryLower) {
@@ -137,16 +146,38 @@ func (v *JSONView) applySearchAsync(q string) {
 			} else if v.matchIndex < 0 || v.matchIndex >= len(matchLines) {
 				v.matchIndex = 0
 			}
+			n := len(matchLines)
 			v.mu.Unlock()
 
 			v.updateNavButtons()
 			v.updateWindow()
+			v.fireSearchResult(n)
 		})
 	}(seq, queryLower, candidates)
 }
 
 func (v *JSONView) applySearch(q string) {
 	v.applySearchAsync(q)
+}
+
+// Search задаёт запрос и запускает поиск (для внешней/единой строки поиска).
+func (v *JSONView) Search(q string) {
+	v.applySearchAsync(q)
+}
+
+// MatchLines возвращает отсортированные индексы исходных строк с совпадениями.
+func (v *JSONView) MatchLines() []int {
+	v.mu.Lock()
+	out := append([]int(nil), v.matchLines...)
+	v.mu.Unlock()
+	sort.Ints(out)
+	return out
+}
+
+func (v *JSONView) fireSearchResult(n int) {
+	if v.OnSearchResult != nil {
+		v.OnSearchResult(n)
+	}
 }
 
 func (v *JSONView) expandMatchesLocked() {

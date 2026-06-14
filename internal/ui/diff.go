@@ -10,6 +10,26 @@ import (
 func diffColorRemoved() color.Color { return color.NRGBA{R: 0xB0, G: 0x33, B: 0x33, A: 0x66} } // слева (A)
 func diffColorAdded() color.Color   { return color.NRGBA{R: 0x2E, G: 0x7D, B: 0x32, A: 0x66} } // справа (B)
 
+// Усиленные цвета для внутристрочной подсветки (A2) — изменившаяся часть строки.
+func diffStrongRemoved() color.Color { return color.NRGBA{R: 0xC0, G: 0x39, B: 0x39, A: 0xC0} }
+func diffStrongAdded() color.Color   { return color.NRGBA{R: 0x35, G: 0x8E, B: 0x3A, A: 0xC0} }
+
+// intraLineSpans возвращает рунные диапазоны изменившейся середины двух строк:
+// отрезаем общий префикс и общий суффикс. Для пар «изменённых» строк это даёт
+// точную часть, которую стоит подсветить (например, 88 → 91).
+func intraLineSpans(a, b string) (aRange, bRange [2]int) {
+	ra, rb := []rune(a), []rune(b)
+	p := 0
+	for p < len(ra) && p < len(rb) && ra[p] == rb[p] {
+		p++
+	}
+	s := 0
+	for s < len(ra)-p && s < len(rb)-p && ra[len(ra)-1-s] == rb[len(rb)-1-s] {
+		s++
+	}
+	return [2]int{p, len(ra) - s}, [2]int{p, len(rb) - s}
+}
+
 // diffMaxCells ограничивает память LCS-таблицы (~16МБ при int32).
 const diffMaxCells = 4_000_000
 

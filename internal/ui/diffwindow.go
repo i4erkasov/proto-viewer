@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"sort"
 	"strings"
 	"time"
 
@@ -138,8 +139,13 @@ func openDiffResult(jsonA, jsonB string) {
 	// hunks/diffIdx обновляются applyTexts; используются навигацией и сводкой.
 	var hunks []diffHunk
 	diffIdx := -1
-	expanded := true          // текущее состояние: всё развёрнуто / свёрнуто
-	var syncExpandIcon func() // обновляет иконку кнопки expand/collapse
+	expanded := true                    // текущее состояние: всё развёрнуто / свёрнуто
+	var syncExpandIcon func()           // обновляет иконку кнопки expand/collapse
+	var refreshSearch func()            // перезапуск поиска после перезагрузки текста
+	var reapplyFold func()              // переприменить «Only changes» после перезагрузки
+	var refreshMinimaps func()          // обновить маркеры изменений на полосах
+	var aChanged, bChanged map[int]bool // изменённые строки A/B (для «Only changes»)
+	var aTotal, bTotal int              // число строк A/B (для мини-карт)
 	label := widget.NewLabel("")
 	updateLabel := func() {
 		if len(hunks) == 0 {
@@ -166,7 +172,8 @@ func openDiffResult(jsonA, jsonB string) {
 		vB.SetJSON(tb)
 
 		// Подсветка различий: слева красным (удалено/изменено), справа зелёным.
-		aDiff, bDiff, hk := computeLineDiff(strings.Split(ta, "\n"), strings.Split(tb, "\n"))
+		aLines, bLines := strings.Split(ta, "\n"), strings.Split(tb, "\n")
+		aDiff, bDiff, hk := computeLineDiff(aLines, bLines)
 		am := make(map[int]color.Color, len(aDiff))
 		for i := range aDiff {
 			am[i] = diffColorRemoved()
@@ -177,6 +184,33 @@ func openDiffResult(jsonA, jsonB string) {
 		}
 		vA.SetDiffLines(am)
 		vB.SetDiffLines(bm)
+		aChanged, bChanged = aDiff, bDiff
+		aTotal, bTotal = len(aLines), len(bLines)
+
+		// A2: внутристрочная подсветка — для пар изменённых строк в каждом хунке
+		// красим только изменившуюся середину.
+		aSpans, bSpans := map[int][2]int{}, map[int][2]int{}
+		for _, h := range hk {
+			n := h.aLen
+			if h.bLen < n {
+				n = h.bLen
+			}
+			for k := 0; k < n; k++ {
+				ai, bi := h.aLine+k, h.bLine+k
+				if ai >= len(aLines) || bi >= len(bLines) {
+					continue
+				}
+				ar, br := intraLineSpans(aLines[ai], bLines[bi])
+				if ar[1] > ar[0] {
+					aSpans[ai] = ar
+				}
+				if br[1] > br[0] {
+					bSpans[bi] = br
+				}
+			}
+		}
+		vA.SetDiffSpans(aSpans, diffStrongRemoved())
+		vB.SetDiffSpans(bSpans, diffStrongAdded())
 		hunks = hk
 		diffIdx = -1
 		updateLabel()
@@ -184,6 +218,15 @@ func openDiffResult(jsonA, jsonB string) {
 		expanded = true
 		if syncExpandIcon != nil {
 			syncExpandIcon()
+		}
+		if refreshSearch != nil {
+			refreshSearch()
+		}
+		if reapplyFold != nil {
+			reapplyFold()
+		}
+		if refreshMinimaps != nil {
+			refreshMinimaps()
 		}
 	}
 
@@ -247,46 +290,169 @@ func openDiffResult(jsonA, jsonB string) {
 		updateLabel()
 	}
 
+	// «Only changes» (C2): сворачивает неизменённые JSON-узлы в обеих панелях.
+	onlyChanges := widget.NewCheck("Only changes", func(on bool) {
+		if on {
+			vA.CollapseUnchanged(aChanged)
+			vB.CollapseUnchanged(bChanged)
+			expanded = false
+		} else {
+			vA.ExpandAll()
+			vB.ExpandAll()
+			expanded = true
+		}
+		syncExpandIcon()
+	})
+	reapplyFold = func() {
+		if onlyChanges.Checked {
+			vA.CollapseUnchanged(aChanged)
+			vB.CollapseUnchanged(bChanged)
+			expanded = false
+			syncExpandIcon()
+		}
+	}
+
+	// Навигация по изменениям (◀/▶ сверху).
 	prev := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() { nav(-1) })
 	next := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() { nav(1) })
 	prev.Importance = widget.LowImportance
 	next.Importance = widget.LowImportance
-	bar := container.NewHBox(
-		toggleExpand,
-		normalize,
-		layout.NewSpacer(),
-		prev, next,
-	)
+	bar := container.NewHBox(toggleExpand, onlyChanges, normalize, layout.NewSpacer(), prev, next)
 	// Сводка различий (~N +N −N) и позиция [i/n] — внизу окна.
 	statusBar := container.NewHBox(layout.NewSpacer(), label, layout.NewSpacer())
 
-	paneA := container.NewBorder(
-		container.NewHBox(layout.NewSpacer(), vA.SearchBar()), nil, nil, nil, vA.View())
-	paneB := container.NewBorder(
-		container.NewHBox(layout.NewSpacer(), vB.SearchBar()), nil, nil, nil, vB.View())
+	// --- Единый поиск по обеим панелям (B1+B2): одна строка, объединённая
+	// навигация, синхронный переход (общий скролл подтягивает вторую панель).
+	searchEntry := widget.NewEntry()
+	searchEntry.SetPlaceHolder("Find in both panes…")
+	searchCount := widget.NewLabel("")
+	type smatch struct{ pane, line int }
+	var (
+		aMatches, bMatches []int
+		combined           []smatch
+		searchIdx          = -1
+	)
+	updateSearchCount := func() {
+		switch {
+		case strings.TrimSpace(searchEntry.Text) == "":
+			searchCount.SetText("")
+		case len(combined) == 0:
+			searchCount.SetText("0")
+		case searchIdx < 0:
+			searchCount.SetText(fmt.Sprintf("%d", len(combined)))
+		default:
+			searchCount.SetText(fmt.Sprintf("%d/%d", searchIdx+1, len(combined)))
+		}
+	}
+	rebuildSearch := func() {
+		// Сливаем совпадения A и B по номеру строки (естественный порядок сверху
+		// вниз); строку, совпавшую в обеих панелях, считаем один раз (панели
+		// выровнены при Normalize, а синхро-скролл покажет обе).
+		combined = combined[:0]
+		seen := map[int]bool{}
+		add := func(l, pane int) {
+			if !seen[l] {
+				seen[l] = true
+				combined = append(combined, smatch{pane, l})
+			}
+		}
+		for _, l := range aMatches {
+			add(l, 0)
+		}
+		for _, l := range bMatches {
+			add(l, 1)
+		}
+		sort.Slice(combined, func(i, j int) bool { return combined[i].line < combined[j].line })
+		searchIdx = -1
+		updateSearchCount()
+	}
+	vA.OnSearchResult = func(int) { aMatches = vA.MatchLines(); rebuildSearch() }
+	vB.OnSearchResult = func(int) { bMatches = vB.MatchLines(); rebuildSearch() }
+
+	searchNav := func(step int) {
+		if len(combined) == 0 {
+			return
+		}
+		searchIdx = (searchIdx + step + len(combined)) % len(combined)
+		m := combined[searchIdx]
+		if m.pane == 0 {
+			vA.ScrollToSourceLine(m.line) // синхро-скролл подтянет вторую панель
+		} else {
+			vB.ScrollToSourceLine(m.line)
+		}
+		updateSearchCount()
+	}
+
+	var searchTimer *time.Timer
+	searchEntry.OnChanged = func(q string) {
+		if searchTimer != nil {
+			searchTimer.Stop()
+		}
+		searchTimer = time.AfterFunc(250*time.Millisecond, func() {
+			vA.Search(q)
+			vB.Search(q)
+		})
+	}
+	searchEntry.OnSubmitted = func(string) { searchNav(1) }
+
+	sPrev := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() { searchNav(-1) })
+	sNext := widget.NewButtonWithIcon("", theme.NavigateNextIcon(), func() { searchNav(1) })
+	sClose := widget.NewButtonWithIcon("", theme.CancelIcon(), nil)
+	sPrev.Importance = widget.LowImportance
+	sNext.Importance = widget.LowImportance
+	sClose.Importance = widget.LowImportance
+	searchRow := container.NewBorder(nil, nil, nil,
+		container.NewHBox(searchCount, sPrev, sNext, sClose), searchEntry)
+	searchRow.Hide()
+
+	searchShown := false
+	showSearch := func(show bool) {
+		searchShown = show
+		if show {
+			searchRow.Show()
+			win.Canvas().Focus(searchEntry)
+		} else {
+			searchRow.Hide()
+			searchEntry.SetText("")
+			vA.Search("")
+			vB.Search("")
+		}
+	}
+	sClose.OnTapped = func() { showSearch(false) }
+
+	refreshSearch = func() {
+		if q := strings.TrimSpace(searchEntry.Text); q != "" {
+			vA.Search(q)
+			vB.Search(q)
+		}
+	}
+
+	// C1: мини-карты изменений на правом краю каждой панели; клик — прыжок
+	// (синхро-скролл подтянет вторую панель).
+	miniA := newDiffMinimap(diffColorRemoved(), func(line int) { vA.ScrollToSourceLine(line) })
+	miniB := newDiffMinimap(diffColorAdded(), func(line int) { vB.ScrollToSourceLine(line) })
+	refreshMinimaps = func() {
+		miniA.SetData(aTotal, aChanged)
+		miniB.SetData(bTotal, bChanged)
+	}
+	refreshMinimaps()
+
+	paneA := container.NewBorder(nil, nil, nil, miniA, vA.View())
+	paneB := container.NewBorder(nil, nil, nil, miniB, vB.View())
 	split := container.NewHSplit(paneA, paneB)
 	split.SetOffset(0.5)
 
-	// Поиск в обоих окнах: Cmd/Ctrl+F открыть, Esc закрыть.
-	toggleFind := func() {
-		show := !(vA.SearchVisible() || vB.SearchVisible())
-		vA.SetSearchVisible(show)
-		vB.SetSearchVisible(show)
-		if show {
-			win.Canvas().Focus(vA.SearchEntry())
-		}
-	}
 	for _, mod := range []fyne.KeyModifier{fyne.KeyModifierShortcutDefault, fyne.KeyModifierControl, fyne.KeyModifierSuper} {
-		win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: mod}, func(_ fyne.Shortcut) { toggleFind() })
+		win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyF, Modifier: mod}, func(_ fyne.Shortcut) { showSearch(!searchShown) })
 	}
 	win.Canvas().AddShortcut(&desktop.CustomShortcut{KeyName: fyne.KeyEscape}, func(_ fyne.Shortcut) {
-		if vA.SearchVisible() || vB.SearchVisible() {
-			vA.SetSearchVisible(false)
-			vB.SetSearchVisible(false)
+		if searchShown {
+			showSearch(false)
 		}
 	})
 
-	win.SetContent(container.NewBorder(bar, statusBar, nil, nil, split))
+	top := container.NewVBox(bar, searchRow)
+	win.SetContent(container.NewBorder(top, statusBar, nil, nil, split))
 	win.Resize(fyne.NewSize(1000, 680))
 	win.Show()
 }

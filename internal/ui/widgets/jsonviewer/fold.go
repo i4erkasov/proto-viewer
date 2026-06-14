@@ -124,6 +124,31 @@ func (v *JSONView) CollapseAll() {
 	v.updateWindow()
 }
 
+// CollapseUnchanged сворачивает узлы, не содержащие ни одной изменённой строки
+// (C2 — «только изменения»): пути к изменениям остаются раскрытыми, а нетронутые
+// поддеревья сворачиваются. changed — множество индексов изменённых исходных строк.
+func (v *JSONView) CollapseUnchanged(changed map[int]bool) {
+	v.mu.Lock()
+	if v.fullBuf == nil || len(v.foldRanges) == 0 {
+		v.mu.Unlock()
+		return
+	}
+	chg := make([]int, 0, len(changed))
+	for l := range changed {
+		chg = append(chg, l)
+	}
+	sort.Ints(chg)
+	for start, end := range v.foldRanges {
+		i := sort.SearchInts(chg, start)
+		hasChange := i < len(chg) && chg[i] <= end // есть изменение в [start,end]
+		v.folded[start] = !hasChange
+	}
+	v.rebuildCurrentViewLocked()
+	v.mu.Unlock()
+	v.resetScroll()
+	v.updateWindow()
+}
+
 // ExpandAll разворачивает все узлы документа.
 func (v *JSONView) ExpandAll() {
 	v.mu.Lock()

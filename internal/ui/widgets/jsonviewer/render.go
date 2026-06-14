@@ -84,7 +84,7 @@ func isNumberChar(r rune) bool {
 	return unicode.IsDigit(r) || r == '.' || r == 'e' || r == 'E' || r == '+' || r == '-'
 }
 
-func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange, lineBgs []color.Color, foldGlyphs []rune) []widget.TextGridRow {
+func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]highlightRange, lineNumWidth int, selectedLine int, selectedRange highlightRange, selSpans []highlightRange, lineBgs []color.Color, foldGlyphs []rune, diffSpans []highlightRange, diffSpanColor color.Color) []widget.TextGridRow {
 	if len(lines) == 0 {
 		return nil
 	}
@@ -116,10 +116,14 @@ func buildTextGridRows(lines [][]byte, srcLines []int, highlights map[int][]high
 		if i < len(lineBgs) {
 			lineBg = lineBgs[i]
 		}
+		var diffSpan highlightRange
+		if i < len(diffSpans) {
+			diffSpan = diffSpans[i]
+		}
 		fullLine := make([]byte, 0, len(prefix)+len(line))
 		fullLine = append(fullLine, prefix...)
 		fullLine = append(fullLine, line...)
-		cells := buildTextGridCells(fullLine, hl, len(prefix), sel, selBg, lineBg)
+		cells := buildTextGridCells(fullLine, hl, len(prefix), sel, selBg, lineBg, diffSpan, diffSpanColor)
 		rows = append(rows, widget.TextGridRow{Cells: cells})
 	}
 	return rows
@@ -154,7 +158,7 @@ func cellStyle(fg, bg color.Color, bold bool) *widget.CustomTextGridStyle {
 	return s
 }
 
-func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange, selBg highlightRange, lineBg color.Color) []widget.TextGridCell {
+func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int, selected highlightRange, selBg highlightRange, lineBg color.Color, diffSpan highlightRange, diffSpanColor color.Color) []widget.TextGridCell {
 	if len(line) == 0 {
 		return nil
 	}
@@ -166,6 +170,7 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 	lnBg := lineNumberBgColor()
 	selColor := selectionColor()
 	hasSel := selBg.end > selBg.start
+	hasDiffSpan := diffSpan.end > diffSpan.start && diffSpanColor != nil
 
 	// Prefix (line numbers) is ASCII, so its rune length equals its byte length.
 	prefixRuneLen := prefixLen
@@ -244,6 +249,8 @@ func buildTextGridCells(line []byte, highlights []highlightRange, prefixLen int,
 					bg = selColor // выделение текста перекрывает подсветку поиска
 				case inHighlight(cc):
 					bg = hlBg
+				case hasDiffSpan && cc >= diffSpan.start && cc < diffSpan.end:
+					bg = diffSpanColor // A2: усиленная подсветка изменившейся части строки
 				}
 				if inSelected(cc) {
 					bold = true
@@ -599,6 +606,24 @@ func (v *JSONView) SetDiffLines(m map[int]color.Color) {
 	v.updateWindow()
 }
 
+// SetDiffSpans задаёт внутристрочную подсветку изменившейся части строк (A2):
+// spans[srcLine] = {start,end} в рунных смещениях контента, c — её цвет.
+func (v *JSONView) SetDiffSpans(spans map[int][2]int, c color.Color) {
+	v.mu.Lock()
+	if len(spans) == 0 {
+		v.diffSpans = nil
+	} else {
+		m := make(map[int]highlightRange, len(spans))
+		for line, r := range spans {
+			m[line] = highlightRange{start: r[0], end: r[1]}
+		}
+		v.diffSpans = m
+		v.diffSpanColor = c
+	}
+	v.mu.Unlock()
+	v.updateWindow()
+}
+
 // ScrollToSourceLine прокручивает к строке исходного JSON. Если строка скрыта
 // внутри свёрнутого узла — разворачивает узлы по пути к ней.
 func (v *JSONView) ScrollToSourceLine(src int) {
@@ -670,6 +695,23 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 		}
 	}
 
+	// Внутристрочная подсветка изменившейся части (A2) — по исходной строке.
+	v.mu.Lock()
+	diffSpansMap := v.diffSpans
+	diffSpanColor := v.diffSpanColor
+	v.mu.Unlock()
+	var diffSpans []highlightRange
+	if len(diffSpansMap) > 0 {
+		diffSpans = make([]highlightRange, len(lineBytes))
+		for i := range lineBytes {
+			if i < len(srcLines) {
+				if r, ok := diffSpansMap[srcLines[i]]; ok {
+					diffSpans[i] = r
+				}
+			}
+		}
+	}
+
 	// Глифы сворачивания: ▸ для свёрнутого узла, ▾ для развёрнутого.
 	foldGlyphs := make([]rune, len(lineBytes))
 	v.mu.Lock()
@@ -688,5 +730,5 @@ func (v *JSONView) buildRowsForView(viewLines []int) []widget.TextGridRow {
 	}
 	v.mu.Unlock()
 
-	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans, lineBgs, foldGlyphs)
+	return buildTextGridRows(lineBytes, srcLines, highlights, lineNumWidth, selectedLine, selectedRange, selSpans, lineBgs, foldGlyphs, diffSpans, diffSpanColor)
 }
