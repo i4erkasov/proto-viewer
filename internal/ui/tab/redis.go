@@ -27,7 +27,6 @@ const (
 	prefRedisUsername     = "redis.username"
 	prefRedisSavePassword = "redis.savePassword"
 	prefRedisPassEnc      = "redis.passwordEnc"
-	prefRedisGzip         = "redis.gzip"
 )
 
 type RedisTab struct {
@@ -64,8 +63,6 @@ type RedisTab struct {
 	connected bool
 
 	root fyne.CanvasObject
-
-	gzipCheck *widget.Check
 }
 
 func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
@@ -148,12 +145,8 @@ func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
 	t.port.OnChanged = func(s string) { prefs.SetString(prefRedisPort, strings.TrimSpace(s)) }
 	t.user.OnChanged = func(s string) { prefs.SetString(prefRedisUsername, strings.TrimSpace(s)) }
 
-	// GZIP checkbox placed after Key selector.
-	t.gzipCheck = widget.NewCheck("GZIP compressed", func(checked bool) {
-		prefs.SetBool(prefRedisGzip, checked)
-	})
-	t.gzipCheck.SetChecked(prefs.Bool(prefRedisGzip))
-	gzipWrap := container.NewGridWrap(t.gzipCheck.MinSize(), t.gzipCheck)
+	// GZIP/base64/hex/zlib теперь определяются автоматически в декодере
+	// (detectEncoding) — ручная галка убрана.
 
 	// --- Row 1: Host / Port / TLS
 	entryH := t.host.MinSize().Height
@@ -195,7 +188,6 @@ func NewTabRedis(w fyne.Window, repo domain.RedisRepository) *RedisTab {
 	selectorsRow := container.NewHBox(
 		widget.NewLabel("DB:"), dbWrap,
 		widget.NewLabel("Key:"), keyWrap,
-		gzipWrap,
 		t.fieldLabel, fieldWrap,
 	)
 
@@ -560,14 +552,6 @@ func (t *RedisTab) onKeySelected(k string) {
 			})
 		}
 	}()
-}
-
-// Gzip returns current GZIP checkbox state.
-func (t *RedisTab) Gzip() bool {
-	if t.gzipCheck == nil {
-		return false
-	}
-	return t.gzipCheck.Checked
 }
 
 func (t *RedisTab) Fetch(ctx context.Context) ([]byte, error) {

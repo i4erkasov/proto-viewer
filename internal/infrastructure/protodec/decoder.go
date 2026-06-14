@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,11 +146,88 @@ func compileDescriptorSet(ctx context.Context, protoRoot, protoAbs string) (*des
 	return fds, nil
 }
 
+// allRootKey — отдельный ключ кэша для набора «все .proto под root».
+const allRootKey = "\x00ALL"
+
+// compileAllUnderRoot компилирует ВСЕ .proto под protoRoot в единый набор.
+// Используется авто-детектом типа, когда конкретный Proto file не выбран.
+func compileAllUnderRoot(ctx context.Context, protoRoot string) (*descriptorpb.FileDescriptorSet, error) {
+	key := descKey(protoRoot, allRootKey)
+	if fds, ok := descCacheGet(key); ok {
+		perf.Log("descriptor cache hit (all under %s)", protoRoot)
+		return fds, nil
+	}
+
+	var rels []string
+	err := filepath.WalkDir(protoRoot, func(path string, dEntry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if dEntry.IsDir() || !strings.HasSuffix(strings.ToLower(dEntry.Name()), ".proto") {
+			return nil
+		}
+		rel, rerr := relToRoot(protoRoot, path)
+		if rerr != nil {
+			return rerr
+		}
+		rels = append(rels, filepath.ToSlash(rel))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(rels) == 0 {
+		return nil, fmt.Errorf("no .proto files found under %s", protoRoot)
+	}
+
+	// Быстрый путь: компилируем всё разом.
+	if fds, err := runProtocDescriptorSet(ctx, protoRoot, rels...); err == nil {
+		descCachePut(key, protoRoot, fds)
+		return fds, nil
+	}
+
+	// Устойчивый путь: какой-то файл не компилируется (например, импортирует
+	// внешнюю buf-зависимость). Компилируем по одному, пропуская проблемные,
+	// и объединяем успешные наборы.
+	// Порядок важен: protodesc.NewFiles ждёт зависимости раньше зависимых.
+	// Внутри каждого набора импорты идут перед файлом — сохраняем этот порядок,
+	// дедуплицируя по имени.
+	fds := &descriptorpb.FileDescriptorSet{}
+	seen := map[string]bool{}
+	var skipped int
+	var firstErr error
+	for _, rel := range rels {
+		sub, err := runProtocDescriptorSet(ctx, protoRoot, rel)
+		if err != nil {
+			skipped++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		for _, f := range sub.GetFile() {
+			if !seen[f.GetName()] {
+				seen[f.GetName()] = true
+				fds.File = append(fds.File, f)
+			}
+		}
+	}
+	if skipped > 0 {
+		perf.Log("compile root: skipped %d/%d .proto with unresolved imports (e.g. %v)", skipped, len(rels), firstErr)
+	}
+	if len(fds.File) == 0 {
+		return nil, firstErr
+	}
+
+	descCachePut(key, protoRoot, fds)
+	return fds, nil
+}
+
 // runProtocDescriptorSet компилирует .proto в FileDescriptorSet прямо в процессе
 // через protocompile (без внешнего protoc). Возвращает набор со всеми импортами
 // (аналог protoc --include_imports).
-func runProtocDescriptorSet(ctx context.Context, protoRoot, relProto string) (*descriptorpb.FileDescriptorSet, error) {
-	stop := perf.Track("compile descriptor_set (" + relProto + ")")
+func runProtocDescriptorSet(ctx context.Context, protoRoot string, rels ...string) (*descriptorpb.FileDescriptorSet, error) {
+	stop := perf.Track("compile descriptor_set (" + strings.Join(rels, ",") + ")")
 	defer stop()
 
 	compiler := protocompile.Compiler{
@@ -158,7 +236,7 @@ func runProtocDescriptorSet(ctx context.Context, protoRoot, relProto string) (*d
 		}),
 		SourceInfoMode: protocompile.SourceInfoNone,
 	}
-	files, err := compiler.Compile(ctx, relProto)
+	files, err := compiler.Compile(ctx, rels...)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +350,9 @@ func buildTypeResolver(files *protoregistry.Files) *protoregistry.Types {
 
 func decodeRaw(_ context.Context, binBytes []byte) (string, error) {
 	var sb strings.Builder
-	if err := dumpRawFields(&sb, binBytes, 0); err != nil {
+	// tolerant=true: на усечённом хвосте показываем распарсенное + пометку,
+	// а не падаем целиком (полезно для capped-дампов вроде meta.bin).
+	if err := dumpRawFields(&sb, binBytes, 0, true); err != nil {
 		return "", err
 	}
 	return sb.String(), nil
@@ -298,50 +378,59 @@ func isProbablyText(v []byte) bool {
 	return true
 }
 
-func dumpRawFields(sb *strings.Builder, b []byte, depth int) error {
+func dumpRawFields(sb *strings.Builder, b []byte, depth int, tolerant bool) error {
 	if depth > 100 {
 		return fmt.Errorf("nesting too deep")
 	}
 	pad := strings.Repeat("  ", depth)
+	// fail обрабатывает невалидное/усечённое поле: при tolerant — печатает
+	// пометку и сворачивает разбор (return nil), иначе возвращает ошибку.
+	fail := func(remaining int) error {
+		if tolerant {
+			fmt.Fprintf(sb, "%s… truncated (%d bytes unparsed)\n", pad, remaining)
+			return nil
+		}
+		return fmt.Errorf("malformed protobuf")
+	}
 	for len(b) > 0 {
 		num, typ, n := protowire.ConsumeTag(b)
-		if n < 0 {
-			return protowire.ParseError(n)
+		if n < 0 || num < 1 || typ > 5 {
+			return fail(len(b))
 		}
 		b = b[n:]
 		switch typ {
 		case protowire.VarintType:
 			v, n := protowire.ConsumeVarint(b)
 			if n < 0 {
-				return protowire.ParseError(n)
+				return fail(len(b))
 			}
 			b = b[n:]
 			fmt.Fprintf(sb, "%s%d: %d\n", pad, num, v)
 		case protowire.Fixed32Type:
 			v, n := protowire.ConsumeFixed32(b)
 			if n < 0 {
-				return protowire.ParseError(n)
+				return fail(len(b))
 			}
 			b = b[n:]
 			fmt.Fprintf(sb, "%s%d: 0x%08x\n", pad, num, v)
 		case protowire.Fixed64Type:
 			v, n := protowire.ConsumeFixed64(b)
 			if n < 0 {
-				return protowire.ParseError(n)
+				return fail(len(b))
 			}
 			b = b[n:]
 			fmt.Fprintf(sb, "%s%d: 0x%016x\n", pad, num, v)
 		case protowire.BytesType:
 			v, n := protowire.ConsumeBytes(b)
 			if n < 0 {
-				return protowire.ParseError(n)
+				return fail(len(b))
 			}
 			b = b[n:]
 			var nested strings.Builder
 			switch {
 			case isProbablyText(v):
 				fmt.Fprintf(sb, "%s%d: %q\n", pad, num, string(v))
-			case len(v) > 0 && dumpRawFields(&nested, v, depth+1) == nil:
+			case len(v) > 0 && dumpRawFields(&nested, v, depth+1, false) == nil:
 				fmt.Fprintf(sb, "%s%d: {\n%s%s}\n", pad, num, nested.String(), pad)
 			default:
 				fmt.Fprintf(sb, "%s%d: %x\n", pad, num, v)
@@ -349,49 +438,37 @@ func dumpRawFields(sb *strings.Builder, b []byte, depth int) error {
 		case protowire.StartGroupType:
 			v, n := protowire.ConsumeGroup(num, b)
 			if n < 0 {
-				return protowire.ParseError(n)
+				return fail(len(b))
 			}
 			b = b[n:]
 			var nested strings.Builder
-			_ = dumpRawFields(&nested, v, depth+1)
+			_ = dumpRawFields(&nested, v, depth+1, false)
 			fmt.Fprintf(sb, "%s%d: {\n%s%s}\n", pad, num, nested.String(), pad)
 		default:
-			return fmt.Errorf("unknown wire type %d", typ)
+			return fail(len(b))
 		}
 	}
 	return nil
 }
 
 func (d *Decoder) Decode(ctx context.Context, req domain.DecodeRequest) (domain.DecodeResult, error) {
-	// 1) Prepare bytes according to explicit UI flag.
-	bin := req.Bytes
-	if req.Gzip {
-		unz, err := gunzipBytes(bin)
-		if err != nil {
-			// If user marked gzip but bytes aren't gzip, try decoding as-is.
-			// This is especially useful for Redis where data may be plain.
-			bin = req.Bytes
-		} else {
-			bin = unz
-		}
-	}
+	// Слой-1 авто-детект: снимаем gzip/zlib/base64/hex (одинаково для File и Redis).
+	// Явный флаг req.Gzip теперь избыточен (gzip определяется по magic-байтам) и
+	// сохранён лишь для обратной совместимости / ключей кэша.
+	unwrapped, chain := detectEncoding(req.Bytes)
 
-	// 2) Try normal decode.
-	res, err := d.decodeWithBytes(ctx, req, bin)
+	res, err := d.decodeWithBytes(ctx, req, unwrapped)
 	if err == nil {
+		res.DetectedChain = chain
+		res.AutoDetectedGzip = containsStr(chain, encGzip)
 		return res, nil
 	}
 
-	// 3) Auto-detect gzip when decode failed.
-	// If bytes look like gzip -> try decompress + decode.
-	// NOTE: we only try this when gzip wasn't already successfully applied.
-	if !req.Gzip && looksLikeGzip(req.Bytes) {
-		unz, gerr := gunzipBytes(req.Bytes)
-		if gerr == nil {
-			if res2, err2 := d.decodeWithBytes(ctx, req, unz); err2 == nil {
-				res2.AutoDetectedGzip = true
-				return res2, nil
-			}
+	// Если развёртка изменила байты, но декод не удался — пробуем исходные.
+	if !bytes.Equal(unwrapped, req.Bytes) {
+		if res2, err2 := d.decodeWithBytes(ctx, req, req.Bytes); err2 == nil {
+			res2.DetectedChain = []string{classifyPayload(req.Bytes)}
+			return res2, nil
 		}
 	}
 

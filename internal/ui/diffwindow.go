@@ -52,9 +52,6 @@ func openDiffWindow(parent fyne.Window, deps Deps, jsonA string, getProto func()
 		switch tabs.SelectedIndex() {
 		case 1:
 			src = redisTab
-			if gz, ok := any(redisTab).(interface{ Gzip() bool }); ok {
-				gzip = gz.Gzip()
-			}
 		default:
 			src = fileTab
 		}

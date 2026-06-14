@@ -681,12 +681,8 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		loadPresetDialog.Show()
 	})
 
-	// --- GZIP
-	gzipCheck := widget.NewCheck("GZIP compressed", nil)
-	gzipCheck.SetChecked(false)
-	gzipHint := widget.NewLabel("")
-	gzipHint.TextStyle = fyne.TextStyle{Italic: true}
-	gzipHint.Hide()
+	// GZIP (и base64/hex/zlib) теперь определяются автоматически в декодере
+	// (см. detectEncoding), ручная галка убрана.
 
 	// --- Browse buttons
 	btnBrowseRoot := widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {
@@ -753,9 +749,60 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 	protoRootRow := container.NewBorder(nil, nil, lblProtoRootWrap, btnBrowseRootWrap, protoRoot)
 	protoFileRow := container.NewBorder(nil, nil, lblProtoFileWrap, btnBrowseProtoWrap, protoFile)
 
+	// Detect — авто-подбор типа сообщения по байтам текущего источника.
+	btnDetect := widget.NewButtonWithIcon("Detect", theme.SearchIcon(), nil)
+	btnDetect.OnTapped = func() {
+		root := strings.TrimSpace(protoRoot.Text)
+		protoAbs := strings.TrimSpace(protoFile.Text) // необязателен: пусто → ищем по всему root
+		if root == "" {
+			dialog.ShowError(fmt.Errorf("задай Proto root (Proto file необязателен — поиск по всей папке)"), w)
+			return
+		}
+		var src interface {
+			Fetch(context.Context) ([]byte, error)
+		}
+		switch sourceTabs.SelectedIndex() {
+		case 0:
+			src = fileTab
+		case 1:
+			src = redisTab
+		default:
+			dialog.ShowError(fmt.Errorf("unknown source tab"), w)
+			return
+		}
+		btnDetect.Disable()
+		go func() {
+			defer fyne.Do(func() { btnDetect.Enable() })
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer cancel()
+			payload, err := src.Fetch(ctx)
+			if err != nil {
+				fyne.Do(func() { dialog.ShowError(err, w) })
+				return
+			}
+			guesses, err := dec.GuessType(ctx, root, protoAbs, payload)
+			if err != nil {
+				fyne.Do(func() { dialog.ShowError(err, w) })
+				return
+			}
+			fyne.Do(func() {
+				showTypeGuesses(w, guesses, func(fullType, protoRel string) {
+					if protoRel != "" {
+						// Подставляем и Proto file (нужен для декода), затем тип.
+						abs := filepath.Join(root, filepath.FromSlash(protoRel))
+						protoFile.SetText(abs)
+						loadProtoTypesAndSelect(abs, fullType)
+					} else {
+						typeSelect.SetSelected(fullType)
+					}
+				})
+			})
+		}()
+	}
+
 	msgTypeRow := container.NewBorder(nil, nil,
 		widget.NewLabel("Message type:"),
-		container.NewHBox(btnSavePreset, btnLoadPreset),
+		container.NewHBox(btnDetect, btnSavePreset, btnLoadPreset),
 		typeSelect,
 	)
 
@@ -852,7 +899,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		if fileInputPath != "" {
 			inFI, _ := os.Stat(fileInputPath)
 			protoFI, _ := os.Stat(protoAbs)
-			key := cache.FileKey(fileInputPath, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
+			key := cache.FileKey(fileInputPath, protoAbs, typeName, false, inFI, protoFI)
 			if cached, ok, _ := dc.Read(key); ok {
 				fullJSON = cached
 				setOutput(fullJSON)
@@ -865,16 +912,11 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		var src interface {
 			Fetch(context.Context) ([]byte, error)
 		}
-		// Allow per-tab GZIP flag override (Redis row checkbox).
-		effectiveGzip := gzipCheck.Checked
 		switch sourceTabs.SelectedIndex() {
 		case 0:
 			src = fileTab
 		case 1:
 			src = redisTab
-			if gz, ok := any(redisTab).(interface{ Gzip() bool }); ok {
-				effectiveGzip = gz.Gzip()
-			}
 		default:
 			lblStatus.SetText("Status: error")
 			dialog.ShowError(fmt.Errorf("unknown source tab"), w)
@@ -927,7 +969,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				if key != "" {
 					protoAbs := strings.TrimSpace(protoFile.Text)
 					msgType := strings.TrimSpace(typeSelect.Selected())
-					keyHash := cache.RedisKey(db, key, field, protoAbs, msgType, gzipCheck.Checked, payload)
+					keyHash := cache.RedisKey(db, key, field, protoAbs, msgType, false, payload)
 					if cached, ok, _ := dc.Read(keyHash); ok {
 						fyne.Do(func() {
 							fullJSON = cached
@@ -944,7 +986,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				ProtoRoot: root,
 				ProtoFile: protoAbs,
 				FullType:  typeName,
-				Gzip:      effectiveGzip,
+				Gzip:      false, // авто-детект в декодере
 				Format:    domain.OutputFormatJSON,
 				Bytes:     payload,
 			})
@@ -968,8 +1010,8 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			if fileInputPath != "" {
 				inFI, _ := os.Stat(fileInputPath)
 				protoFI, _ := os.Stat(protoAbs)
-				key := cache.FileKey(fileInputPath, protoAbs, typeName, gzipCheck.Checked, inFI, protoFI)
-				meta := cache.Meta{InputPath: fileInputPath, ProtoFile: protoAbs, MessageType: typeName, Gzip: gzipCheck.Checked}
+				key := cache.FileKey(fileInputPath, protoAbs, typeName, false, inFI, protoFI)
+				meta := cache.Meta{InputPath: fileInputPath, ProtoFile: protoAbs, MessageType: typeName, Gzip: false}
 				if inFI != nil {
 					meta.InputSize = inFI.Size()
 					meta.InputMtime = inFI.ModTime().UnixNano()
@@ -1000,12 +1042,12 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 				if key != "" {
 					protoAbs := strings.TrimSpace(protoFile.Text)
 					msgType := strings.TrimSpace(typeSelect.Selected())
-					keyHash := cache.RedisKey(db, key, field, protoAbs, msgType, gzipCheck.Checked, payload)
+					keyHash := cache.RedisKey(db, key, field, protoAbs, msgType, false, payload)
 					meta := cache.Meta{
 						InputPath:   "redis://" + key,
 						MessageType: msgType,
 						ProtoFile:   protoAbs,
-						Gzip:        gzipCheck.Checked,
+						Gzip:        false,
 					}
 					_, _ = dc.Write(keyHash, meta, jsonText)
 				}
@@ -1015,7 +1057,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			const bigJSON = 2_000_000
 			if len(jsonText) >= bigJSON && cachedPath != "" {
 				fyne.Do(func() {
-					lblStatus.SetText("Status: OK (saved to file)")
+					lblStatus.SetText("Status: OK (saved to file)" + formatDetectChain(res.DetectedChain))
 
 					// Build dialog content with custom buttons so we can place icons.
 					var dlg dialog.Dialog
@@ -1061,7 +1103,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 			fyne.Do(func() {
 				fullJSON = jsonText
 				setOutput(fullJSON)
-				lblStatus.SetText("Status: OK")
+				lblStatus.SetText("Status: OK" + formatDetectChain(res.DetectedChain))
 			})
 		}()
 	}
@@ -1081,7 +1123,7 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 		return strings.TrimSpace(protoRoot.Text),
 			strings.TrimSpace(protoFile.Text),
 			strings.TrimSpace(typeSelect.Selected()),
-			gzipCheck.Checked
+			false
 	}
 
 	// Кнопка Diff: сторона A — текущий результат, B выбирается в отдельном окне.
@@ -1341,3 +1383,12 @@ func build(w fyne.Window, deps Deps) fyne.CanvasObject {
 }
 
 // (shortcut helpers moved to platform-specific files)
+
+// formatDetectChain превращает цепочку авто-детекта (слой 1) в суффикс статуса,
+// например " · base64 → gzip → protobuf". Пусто, если детекта нет.
+func formatDetectChain(chain []string) string {
+	if len(chain) == 0 {
+		return ""
+	}
+	return " · " + strings.Join(chain, " → ")
+}
