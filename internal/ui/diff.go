@@ -1,6 +1,10 @@
 package ui
 
-import "image/color"
+import (
+	"encoding/json"
+	"image/color"
+	"strings"
+)
 
 // Цвета подсветки строк в режиме Diff (полупрозрачные поверх фона).
 func diffColorRemoved() color.Color { return color.NRGBA{R: 0xB0, G: 0x33, B: 0x33, A: 0x66} } // слева (A)
@@ -9,10 +13,45 @@ func diffColorAdded() color.Color   { return color.NRGBA{R: 0x2E, G: 0x7D, B: 0x
 // diffMaxCells ограничивает память LCS-таблицы (~16МБ при int32).
 const diffMaxCells = 4_000_000
 
-// diffHunk — начало участка различий: строка в A и соответствующая в B.
-// Для навигации (◀/▶) прокручиваем A к aLine, B к bLine.
+// diffHunk — участок различий: начальные строки в A/B (для навигации ◀/▶) и
+// число различающихся строк с каждой стороны (для сводки changed/added/removed).
 type diffHunk struct {
 	aLine, bLine int
+	aLen, bLen   int
+}
+
+// diffSummary классифицирует хунки: участок со строками с обеих сторон —
+// «изменено», только в B — «добавлено», только в A — «удалено».
+func diffSummary(hunks []diffHunk) (changed, added, removed int) {
+	for _, h := range hunks {
+		switch {
+		case h.aLen > 0 && h.bLen > 0:
+			changed++
+		case h.bLen > 0:
+			added++
+		case h.aLen > 0:
+			removed++
+		}
+	}
+	return
+}
+
+// canonicalJSON приводит JSON к каноническому виду: рекурсивно сортирует ключи
+// объектов (encoding/json маршалит map с сортировкой), снимая «шум» от разного
+// порядка ключей в map. UseNumber сохраняет точность чисел (int64 не плывёт).
+// При невалидном входе возвращает строку без изменений.
+func canonicalJSON(s string) string {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v interface{}
+	if err := dec.Decode(&v); err != nil {
+		return s
+	}
+	out, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return s
+	}
+	return string(out)
 }
 
 // computeLineDiff возвращает индексы различающихся строк для каждой стороны и
@@ -35,7 +74,7 @@ func computeLineDiff(a, b []string) (aDiff, bDiff map[int]bool, hunks []diffHunk
 			bDiff[j] = true
 		}
 		if n > 0 || m > 0 {
-			hunks = append(hunks, diffHunk{0, 0})
+			hunks = append(hunks, diffHunk{aLine: 0, bLine: 0, aLen: n, bLen: m})
 		}
 		return
 	}
@@ -81,35 +120,40 @@ func computeLineDiff(a, b []string) (aDiff, bDiff map[int]bool, hunks []diffHunk
 	}
 
 	i, j := 0, 0
-	inHunk := false
+	cur := -1 // индекс текущего открытого хунка (-1 — вне хунка)
 	for i < n && j < m {
 		if a[i] == b[j] {
 			i++
 			j++
-			inHunk = false
+			cur = -1
 			continue
 		}
-		if !inHunk {
-			hunks = append(hunks, diffHunk{i, j})
-			inHunk = true
+		if cur < 0 {
+			hunks = append(hunks, diffHunk{aLine: i, bLine: j})
+			cur = len(hunks) - 1
 		}
 		if dp[i+1][j] >= dp[i][j+1] {
 			aDiff[i] = true
+			hunks[cur].aLen++
 			i++
 		} else {
 			bDiff[j] = true
+			hunks[cur].bLen++
 			j++
 		}
 	}
 	if i < n || j < m {
-		if !inHunk {
-			hunks = append(hunks, diffHunk{i, j})
+		if cur < 0 {
+			hunks = append(hunks, diffHunk{aLine: i, bLine: j})
+			cur = len(hunks) - 1
 		}
 		for ; i < n; i++ {
 			aDiff[i] = true
+			hunks[cur].aLen++
 		}
 		for ; j < m; j++ {
 			bDiff[j] = true
+			hunks[cur].bLen++
 		}
 	}
 	return
@@ -127,26 +171,28 @@ func fallbackHunks(aDiff, bDiff map[int]bool, n, m int) []diffHunk {
 		}
 		return v
 	}
-	prev := false
+	cur := -1
 	for i := 0; i < n; i++ {
 		if aDiff[i] {
-			if !prev {
-				hunks = append(hunks, diffHunk{i, clamp(i, m)})
+			if cur < 0 {
+				hunks = append(hunks, diffHunk{aLine: i, bLine: clamp(i, m)})
+				cur = len(hunks) - 1
 			}
-			prev = true
+			hunks[cur].aLen++
 		} else {
-			prev = false
+			cur = -1
 		}
 	}
-	prev = false
+	cur = -1
 	for j := 0; j < m; j++ {
 		if bDiff[j] {
-			if !prev {
-				hunks = append(hunks, diffHunk{clamp(j, n), j})
+			if cur < 0 {
+				hunks = append(hunks, diffHunk{aLine: clamp(j, n), bLine: j})
+				cur = len(hunks) - 1
 			}
-			prev = true
+			hunks[cur].bLen++
 		} else {
-			prev = false
+			cur = -1
 		}
 	}
 	return hunks

@@ -137,21 +137,84 @@ func openDiffResult(jsonA, jsonB string) {
 	vB.SetKeySelectVisible(false)
 	vA.SetSearchWidth(356)
 	vB.SetSearchWidth(356)
-	vA.SetJSON(jsonA)
-	vB.SetJSON(jsonB)
 
-	// Подсветка различий: слева красным (удалено/изменено), справа зелёным.
-	aDiff, bDiff, hunks := computeLineDiff(strings.Split(jsonA, "\n"), strings.Split(jsonB, "\n"))
-	am := make(map[int]color.Color, len(aDiff))
-	for i := range aDiff {
-		am[i] = diffColorRemoved()
+	// hunks/diffIdx обновляются applyTexts; используются навигацией и сводкой.
+	var hunks []diffHunk
+	diffIdx := -1
+	expanded := true          // текущее состояние: всё развёрнуто / свёрнуто
+	var syncExpandIcon func() // обновляет иконку кнопки expand/collapse
+	label := widget.NewLabel("")
+	updateLabel := func() {
+		if len(hunks) == 0 {
+			label.SetText("no diffs")
+			return
+		}
+		c, a, r := diffSummary(hunks)
+		pos := ""
+		if diffIdx >= 0 {
+			pos = fmt.Sprintf("   [%d/%d]", diffIdx+1, len(hunks))
+		}
+		label.SetText(fmt.Sprintf("~%d  +%d  −%d%s", c, a, r, pos))
 	}
-	bm := make(map[int]color.Color, len(bDiff))
-	for j := range bDiff {
-		bm[j] = diffColorAdded()
+
+	// applyTexts (пере)загружает оба вьювера и пересчитывает дифф. normalize —
+	// канонизировать JSON (сортировка ключей), снимая «шум» от порядка map.
+	applyTexts := func(normalize bool) {
+		ta, tb := jsonA, jsonB
+		if normalize {
+			ta = canonicalJSON(jsonA)
+			tb = canonicalJSON(jsonB)
+		}
+		vA.SetJSON(ta)
+		vB.SetJSON(tb)
+
+		// Подсветка различий: слева красным (удалено/изменено), справа зелёным.
+		aDiff, bDiff, hk := computeLineDiff(strings.Split(ta, "\n"), strings.Split(tb, "\n"))
+		am := make(map[int]color.Color, len(aDiff))
+		for i := range aDiff {
+			am[i] = diffColorRemoved()
+		}
+		bm := make(map[int]color.Color, len(bDiff))
+		for j := range bDiff {
+			bm[j] = diffColorAdded()
+		}
+		vA.SetDiffLines(am)
+		vB.SetDiffLines(bm)
+		hunks = hk
+		diffIdx = -1
+		updateLabel()
+		// SetJSON сбрасывает свёртки — после перезагрузки всё развёрнуто.
+		expanded = true
+		if syncExpandIcon != nil {
+			syncExpandIcon()
+		}
 	}
-	vA.SetDiffLines(am)
-	vB.SetDiffLines(bm)
+
+	normalize := widget.NewCheck("Normalize", func(b bool) { applyTexts(b) })
+	normalize.Checked = true // канонизация по умолчанию; снимает шум от порядка map
+	applyTexts(true)
+
+	// Одна кнопка-тумблер expand/collapse; иконка отражает текущее состояние:
+	// «restore» когда развёрнуто (тап свернёт), «fullscreen» когда свёрнуто (тап развернёт).
+	toggleExpand := widget.NewButtonWithIcon("", theme.ViewRestoreIcon(), nil)
+	syncExpandIcon = func() {
+		if expanded {
+			toggleExpand.SetIcon(theme.ViewRestoreIcon())
+		} else {
+			toggleExpand.SetIcon(theme.ViewFullScreenIcon())
+		}
+	}
+	toggleExpand.OnTapped = func() {
+		if expanded {
+			vA.CollapseAll()
+			vB.CollapseAll()
+		} else {
+			vA.ExpandAll()
+			vB.ExpandAll()
+		}
+		expanded = !expanded
+		syncExpandIcon()
+	}
 
 	// Общий (синхронный) скролл — сравниваем построчно.
 	syncing := false
@@ -173,19 +236,6 @@ func openDiffResult(jsonA, jsonB string) {
 	}
 
 	// Навигация по изменениям.
-	diffIdx := -1
-	label := widget.NewLabel("")
-	updateLabel := func() {
-		switch {
-		case len(hunks) == 0:
-			label.SetText("no diffs")
-		case diffIdx < 0:
-			label.SetText(fmt.Sprintf("%d diffs", len(hunks)))
-		default:
-			label.SetText(fmt.Sprintf("%d/%d", diffIdx+1, len(hunks)))
-		}
-	}
-	updateLabel()
 	nav := func(step int) {
 		if len(hunks) == 0 {
 			return
@@ -205,11 +255,13 @@ func openDiffResult(jsonA, jsonB string) {
 	prev.Importance = widget.LowImportance
 	next.Importance = widget.LowImportance
 	bar := container.NewHBox(
-		widget.NewButton("Expand all", func() { vA.ExpandAll(); vB.ExpandAll() }),
-		widget.NewButton("Collapse all", func() { vA.CollapseAll(); vB.CollapseAll() }),
+		toggleExpand,
+		normalize,
 		layout.NewSpacer(),
-		prev, next, label,
+		prev, next,
 	)
+	// Сводка различий (~N +N −N) и позиция [i/n] — внизу окна.
+	statusBar := container.NewHBox(layout.NewSpacer(), label, layout.NewSpacer())
 
 	paneA := container.NewBorder(
 		container.NewHBox(layout.NewSpacer(), vA.SearchBar()), nil, nil, nil, vA.View())
@@ -237,7 +289,7 @@ func openDiffResult(jsonA, jsonB string) {
 		}
 	})
 
-	win.SetContent(container.NewBorder(bar, nil, nil, nil, split))
+	win.SetContent(container.NewBorder(bar, statusBar, nil, nil, split))
 	win.Resize(fyne.NewSize(1000, 680))
 	win.Show()
 }

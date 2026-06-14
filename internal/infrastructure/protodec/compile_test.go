@@ -85,6 +85,40 @@ message Outer { Inner inner = 1; }`), 0o644); err != nil {
 	_ = descByName(t, dir, p, "Outer")
 }
 
+// TestDecodeAnyUnpacked проверяет, что google.protobuf.Any распаковывается
+// (через резолвер из скомпилированного набора), а не показывается как base64.
+func TestDecodeAnyUnpacked(t *testing.T) {
+	dir := t.TempDir()
+	src := `syntax = "proto3";
+import "google/protobuf/any.proto";
+message Inner { string v = 1; }
+message Outer { google.protobuf.Any data = 1; }`
+	p := filepath.Join(dir, "a.proto")
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Собираем байты вручную: Outer{ data = Any{ type_url, value=Inner{v:"hi"} } }.
+	inner := protowire.AppendTag(nil, 1, protowire.BytesType)
+	inner = protowire.AppendBytes(inner, []byte("hi"))
+	var any []byte
+	any = protowire.AppendTag(any, 1, protowire.BytesType)
+	any = protowire.AppendBytes(any, []byte("type.googleapis.com/Inner"))
+	any = protowire.AppendTag(any, 2, protowire.BytesType)
+	any = protowire.AppendBytes(any, inner)
+	var outer []byte
+	outer = protowire.AppendTag(outer, 1, protowire.BytesType)
+	outer = protowire.AppendBytes(outer, any)
+
+	js, err := decodeJSON(context.Background(), dir, "Outer", p, outer)
+	if err != nil {
+		t.Fatalf("decodeJSON: %v", err)
+	}
+	if !strings.Contains(js, "@type") || !strings.Contains(js, `"hi"`) {
+		t.Fatalf("Any не распаковался:\n%s", js)
+	}
+}
+
 func TestDecodeRaw(t *testing.T) {
 	var b []byte
 	b = protowire.AppendTag(b, 1, protowire.VarintType)

@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protodesc"
 	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 	"google.golang.org/protobuf/types/dynamicpb"
 
@@ -231,6 +232,9 @@ func decodeJSON(ctx context.Context, protoRoot, fullType, protoAbs string, binBy
 		Indent:          "  ",
 		UseProtoNames:   true,
 		EmitUnpopulated: false,
+		// Резолвер из скомпилированного набора — чтобы распаковывать
+		// google.protobuf.Any (вложенный тип ищется здесь).
+		Resolver: buildTypeResolver(files),
 	}.Marshal(msg)
 	if err != nil {
 		return "", err
@@ -247,6 +251,25 @@ func decodeJSON(ctx context.Context, protoRoot, fullType, protoAbs string, binBy
 
 // decodeRaw разбирает сырые protobuf-байты без схемы (аналог protoc --decode_raw),
 // прямо в процессе через protowire.
+// buildTypeResolver собирает реестр типов из скомпилированного набора файлов,
+// чтобы protojson мог распаковывать google.protobuf.Any (динамические типы).
+func buildTypeResolver(files *protoregistry.Files) *protoregistry.Types {
+	types := new(protoregistry.Types)
+	var register func(mds protoreflect.MessageDescriptors)
+	register = func(mds protoreflect.MessageDescriptors) {
+		for i := 0; i < mds.Len(); i++ {
+			md := mds.Get(i)
+			_ = types.RegisterMessage(dynamicpb.NewMessageType(md))
+			register(md.Messages()) // вложенные
+		}
+	}
+	files.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
+		register(fd.Messages())
+		return true
+	})
+	return types
+}
+
 func decodeRaw(_ context.Context, binBytes []byte) (string, error) {
 	var sb strings.Builder
 	if err := dumpRawFields(&sb, binBytes, 0); err != nil {

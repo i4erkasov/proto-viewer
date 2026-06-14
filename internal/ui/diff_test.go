@@ -1,6 +1,9 @@
 package ui
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestComputeLineDiffChanged(t *testing.T) {
 	a := []string{"{", `  "id": 42,`, `  "name": "SALAH",`, `  "rating": 88`, "}"}
@@ -62,5 +65,33 @@ func TestComputeLineDiffHunks(t *testing.T) {
 	}
 	if hunks[1].aLine != 4 || hunks[1].bLine != 4 {
 		t.Fatalf("hunk1 = %+v, want {4,4}", hunks[1])
+	}
+}
+
+// TestDiffSummary проверяет классификацию хунков: изменено/добавлено/удалено.
+func TestDiffSummary(t *testing.T) {
+	// Три участка, разделённые общими строками: изменение, удаление, добавление.
+	a := []string{"common1", "CHG_A", "common2", "RM", "common3"}
+	b := []string{"common1", "CHG_B", "common2", "common3", "ADD"}
+	_, _, hunks := computeLineDiff(a, b)
+	changed, added, removed := diffSummary(hunks)
+	if changed != 1 || added != 1 || removed != 1 {
+		t.Fatalf("summary = ~%d +%d -%d, want ~1 +1 -1 (hunks=%+v)", changed, added, removed, hunks)
+	}
+}
+
+// TestCanonicalJSON проверяет сортировку ключей и сохранение больших int64.
+func TestCanonicalJSON(t *testing.T) {
+	out := canonicalJSON(`{"b":1,"a":{"y":2,"x":9223372036854775807}}`)
+	ia, ib := strings.Index(out, `"a"`), strings.Index(out, `"b"`)
+	if ia < 0 || ib < 0 || ia > ib {
+		t.Fatalf("keys not sorted:\n%s", out)
+	}
+	if !strings.Contains(out, "9223372036854775807") {
+		t.Fatalf("int64 lost precision:\n%s", out)
+	}
+	// Невалидный JSON возвращается как есть.
+	if got := canonicalJSON("not json"); got != "not json" {
+		t.Fatalf("invalid input mangled: %q", got)
 	}
 }
